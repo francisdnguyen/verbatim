@@ -1,0 +1,9 @@
+*.md
+!README.md
+
+.claude/
+
+
+*.env
+*.env.local
+*/.env
