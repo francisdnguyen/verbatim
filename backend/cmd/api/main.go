@@ -2,23 +2,33 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
+	"net/http"
 	"os"
 
 	"github.com/joho/godotenv"
 
 	"verbatim/backend/internal/database"
+	"verbatim/backend/internal/handlers"
+	"verbatim/backend/internal/services"
 )
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("no .env file found, reading DATABASE_URL from environment")
+		log.Println("no .env file found, reading config from environment")
 	}
 
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		log.Fatal("DATABASE_URL is not set")
+	}
+	supadataKey := os.Getenv("SUPADATA_API_KEY")
+	if supadataKey == "" {
+		log.Fatal("SUPADATA_API_KEY is not set")
+	}
+	openaiKey := os.Getenv("OPENAI_API_KEY")
+	if openaiKey == "" {
+		log.Fatal("OPENAI_API_KEY is not set")
 	}
 
 	ctx := context.Background()
@@ -29,33 +39,23 @@ func main() {
 	}
 	defer db.Close()
 
-	fmt.Println("Connected to database.")
+	log.Println("Connected to database.")
 
-	// Insert a test user (no-op if it already exists)
-	_, err = db.Exec(ctx,
-		`INSERT INTO users (email, password_hash) VALUES ($1, $2) ON CONFLICT (email) DO NOTHING`,
-		"test@example.com", "test-hash",
-	)
-	if err != nil {
-		log.Fatal(err)
+	transcriptClient := services.NewClient(supadataKey)
+	embedClient := services.NewEmbeddingClient(openaiKey)
+	videoHandler := handlers.NewVideoHandler(db, transcriptClient, embedClient)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/videos", videoHandler.HandleSubmit)
+	mux.HandleFunc("GET /api/videos/{id}", videoHandler.HandleStatus)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
 
-	// Query all users
-	rows, err := db.Query(ctx, "SELECT id, email FROM users")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer rows.Close()
-
-	fmt.Println("Users in database:")
-	for rows.Next() {
-		var id, email string
-		if err := rows.Scan(&id, &email); err != nil {
-			log.Fatal(err)
-		}
-		fmt.Printf("  %s  %s\n", id, email)
-	}
-	if err := rows.Err(); err != nil {
-		log.Fatal(err)
-	}
+	log.Printf("Listening on :%s", port)
+	log.Println("  POST /api/videos       - submit a YouTube video for ingestion")
+	log.Println("  GET  /api/videos/{id}  - poll a video's ingestion status")
+	log.Fatal(http.ListenAndServe(":"+port, mux))
 }

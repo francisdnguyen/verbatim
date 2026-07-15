@@ -2,15 +2,40 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	pgvector "github.com/pgvector/pgvector-go"
 	pgxvec "github.com/pgvector/pgvector-go/pgx"
 
 	"verbatim/backend/internal/models"
 )
+
+// ErrVideoNotFound is returned when a video ID doesn't match any row, so
+// callers (like the status-poll HTTP handler) can return a 404 instead of a
+// generic 500.
+var ErrVideoNotFound = errors.New("video not found")
+
+// ErrInvalidID is returned when a caller-supplied ID isn't a validly
+// formatted UUID, so callers can return a 400 instead of a generic 500.
+var ErrInvalidID = errors.New("invalid id")
+
+// ErrUserNotFound is returned when a video is created for a user_id that
+// doesn't exist, so callers can return a 400 instead of a generic 500.
+var ErrUserNotFound = errors.New("user not found")
+
+// pgErrorCode returns err's Postgres error code (e.g. "23503"), or "" if err
+// isn't a *pgconn.PgError.
+func pgErrorCode(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return ""
+}
 
 // DB wraps a pgx connection pool with the app's repository methods. Embedding
 // *pgxpool.Pool keeps Exec/Query/Close usable directly, alongside the named
@@ -53,8 +78,32 @@ func (db *DB) CreateVideo(ctx context.Context, userID, sourceURL string) (models
 		 RETURNING id, user_id, source_type, source_url, s3_key, title, status, created_at, updated_at`,
 		userID, sourceURL,
 	).Scan(&v.ID, &v.UserID, &v.SourceType, &v.SourceURL, &v.S3Key, &v.Title, &v.Status, &v.CreatedAt, &v.UpdatedAt)
+	if pgErrorCode(err) == "23503" { // foreign_key_violation: user_id doesn't exist
+		return models.Video{}, ErrUserNotFound
+	}
 	if err != nil {
 		return models.Video{}, fmt.Errorf("create video: %w", err)
+	}
+	return v, nil
+}
+
+// GetVideo looks up a single video row by ID, returning ErrVideoNotFound if
+// no such row exists.
+func (db *DB) GetVideo(ctx context.Context, videoID string) (models.Video, error) {
+	var v models.Video
+	err := db.QueryRow(ctx,
+		`SELECT id, user_id, source_type, source_url, s3_key, title, status, created_at, updated_at
+		 FROM videos WHERE id = $1`,
+		videoID,
+	).Scan(&v.ID, &v.UserID, &v.SourceType, &v.SourceURL, &v.S3Key, &v.Title, &v.Status, &v.CreatedAt, &v.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return models.Video{}, ErrVideoNotFound
+	}
+	if pgErrorCode(err) == "22P02" { // invalid_text_representation: videoID isn't a valid UUID
+		return models.Video{}, ErrInvalidID
+	}
+	if err != nil {
+		return models.Video{}, fmt.Errorf("get video: %w", err)
 	}
 	return v, nil
 }

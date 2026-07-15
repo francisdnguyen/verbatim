@@ -8,9 +8,13 @@ import (
 	"verbatim/backend/internal/models"
 )
 
-// IngestYouTubeVideo runs the full transcript → chunk → embed → store
-// pipeline synchronously for one YouTube video, updating its DB status at
-// each stage so a caller polling the video row can see progress.
+// IngestYouTubeVideo creates a new video row, then runs the full
+// transcript → chunk → embed → store pipeline synchronously for it,
+// updating its DB status at each stage so a caller polling the video row
+// can see progress. The HTTP submit handler doesn't call this directly (it
+// needs the row's ID back before the pipeline runs, so it calls CreateVideo
+// and ProcessVideo itself) — this stays as the synchronous entry point used
+// by the live integration test and any other non-HTTP caller.
 func IngestYouTubeVideo(
 	ctx context.Context,
 	db *database.DB,
@@ -23,14 +27,29 @@ func IngestYouTubeVideo(
 		return models.Video{}, fmt.Errorf("ingest video: %w", err)
 	}
 
+	if err = ProcessVideo(ctx, db, transcriptClient, embedClient, video, videoURL, lang); err != nil {
+		return video, err
+	}
+	video.Status = models.VideoStatusReady
+	return video, nil
+}
+
+// ProcessVideo runs the transcript → chunk → embed → store pipeline for an
+// already-created video row, updating its DB status at each stage. This is
+// the body IngestYouTubeVideo runs synchronously, and the body an async
+// caller (the HTTP submit handler) runs in a goroutine after creating the
+// row itself, so it can return the row's ID to the client immediately.
+func ProcessVideo(
+	ctx context.Context,
+	db *database.DB,
+	transcriptClient *Client,
+	embedClient *EmbeddingClient,
+	video models.Video,
+	videoURL, lang string,
+) (err error) {
 	// If anything below fails, best-effort mark the video failed rather than
 	// leaving it stuck at pending/processing forever. If the failure-update
 	// itself also fails, surface both errors instead of swallowing one.
-	// Critical: every error return below this point must return `video`
-	// (which carries the real ID), never a fresh models.Video{} — the zero
-	// value would overwrite the named return before this defer runs, so
-	// UpdateVideoStatus would be called with an empty ID and silently fail
-	// to mark anything, leaving the row stuck at its previous status forever.
 	defer func() {
 		if err != nil {
 			if updateErr := db.UpdateVideoStatus(ctx, video.ID, models.VideoStatusFailed); updateErr != nil {
@@ -40,23 +59,22 @@ func IngestYouTubeVideo(
 	}()
 
 	if err = db.UpdateVideoStatus(ctx, video.ID, models.VideoStatusProcessing); err != nil {
-		return video, fmt.Errorf("ingest video: %w", err)
+		return fmt.Errorf("process video: %w", err)
 	}
 
 	segments, err := transcriptClient.FetchTranscript(ctx, videoURL, lang)
 	if err != nil {
-		return video, fmt.Errorf("ingest video: fetch transcript: %w", err)
+		return fmt.Errorf("process video: fetch transcript: %w", err)
 	}
 
 	chunks := ChunkSegments(segments, 500, 50)
 	if len(chunks) == 0 {
-		err = fmt.Errorf("ingest video: transcript produced no chunks")
-		return video, err
+		return fmt.Errorf("process video: transcript produced no chunks")
 	}
 
 	chunkEmbeddings, err := embedClient.EmbedChunks(ctx, chunks)
 	if err != nil {
-		return video, fmt.Errorf("ingest video: embed chunks: %w", err)
+		return fmt.Errorf("process video: embed chunks: %w", err)
 	}
 
 	// Map from the in-memory services.Chunk shape to the DB-row models.Chunk
@@ -74,13 +92,12 @@ func IngestYouTubeVideo(
 	}
 
 	if err = db.InsertChunks(ctx, modelChunks); err != nil {
-		return video, fmt.Errorf("ingest video: %w", err)
+		return fmt.Errorf("process video: %w", err)
 	}
 
 	if err = db.UpdateVideoStatus(ctx, video.ID, models.VideoStatusReady); err != nil {
-		return video, fmt.Errorf("ingest video: %w", err)
+		return fmt.Errorf("process video: %w", err)
 	}
-	video.Status = models.VideoStatusReady
 
-	return video, nil
+	return nil
 }
