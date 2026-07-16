@@ -105,6 +105,11 @@ func (c *EmbeddingClient) Ask(ctx context.Context, systemPrompt, userPrompt stri
 			openai.SystemMessage(systemPrompt),
 			openai.UserMessage(userPrompt),
 		},
+		// Deterministic, faithful output — no benefit from sampling randomness
+		// for a grounding/citation task. Capped length bounds worst-case answer
+		// size instead of relying on the API's undocumented default.
+		Temperature:         param.NewOpt(0.0),
+		MaxCompletionTokens: param.NewOpt(int64(500)),
 	})
 	if err != nil {
 		return "", fmt.Errorf("chat completion: %w", err)

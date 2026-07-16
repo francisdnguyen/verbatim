@@ -77,8 +77,11 @@ func AnswerQuestion(
 
 	systemPrompt := "You answer questions about a video using only the transcript excerpts provided. " +
 		"Each excerpt is prefixed with its timestamp range like [MM:SS-MM:SS]. " +
-		"When you use information from an excerpt, cite its timestamp range in your answer. " +
-		"If the excerpts don't contain the answer, say so instead of guessing."
+		"Interpret the question generously — a viewer won't phrase things the way the transcript does. " +
+		"If an excerpt states the answer directly, answer directly and cite its timestamp range. " +
+		"If the excerpts only imply an answer or require a reasonable inference, you may provide one, " +
+		"but say clearly that you're inferring rather than quoting. " +
+		"Only say the video doesn't address this if none of the excerpts are meaningfully related to the question."
 	userPrompt := fmt.Sprintf("Transcript excerpts:\n\n%s\nQuestion: %s", excerpts.String(), question)
 
 	answerText, err := embedClient.Ask(ctx, systemPrompt, userPrompt)
