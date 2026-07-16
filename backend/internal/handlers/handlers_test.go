@@ -27,6 +27,7 @@ func newTestServer(t *testing.T, db *database.DB, supadataKey, openaiKey string)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/videos", h.HandleSubmit)
 	mux.HandleFunc("GET /api/videos/{id}", h.HandleStatus)
+	mux.HandleFunc("POST /api/videos/{id}/ask", h.HandleAsk)
 	return httptest.NewServer(mux)
 }
 
@@ -161,5 +162,75 @@ func TestVideoHandlers_Live(t *testing.T) {
 	badUserResp.Body.Close()
 	if badUserResp.StatusCode != http.StatusBadRequest {
 		t.Errorf("nonexistent user_id status = %d, want %d", badUserResp.StatusCode, http.StatusBadRequest)
+	}
+
+	// Ask a real question about the now-ready video: 200 with a real answer and sources.
+	askBody, _ := json.Marshal(map[string]string{"question": "What is this video about?"})
+	askResp, err := http.Post(srv.URL+"/api/videos/"+video.ID+"/ask", "application/json", bytes.NewReader(askBody))
+	if err != nil {
+		t.Fatalf("POST ask: %v", err)
+	}
+	defer askResp.Body.Close()
+	if askResp.StatusCode != http.StatusOK {
+		t.Fatalf("ask status = %d, want %d", askResp.StatusCode, http.StatusOK)
+	}
+	var ask askResponse
+	if err := json.NewDecoder(askResp.Body).Decode(&ask); err != nil {
+		t.Fatalf("decode ask response: %v", err)
+	}
+	if ask.Answer == "" {
+		t.Error("expected a non-empty answer")
+	}
+	if len(ask.Sources) == 0 {
+		t.Error("expected at least one source")
+	}
+
+	// 404 asking about a nonexistent video.
+	askNotFoundResp, err := http.Post(srv.URL+"/api/videos/00000000-0000-0000-0000-000000000000/ask", "application/json", bytes.NewReader(askBody))
+	if err != nil {
+		t.Fatalf("POST ask nonexistent video: %v", err)
+	}
+	askNotFoundResp.Body.Close()
+	if askNotFoundResp.StatusCode != http.StatusNotFound {
+		t.Errorf("ask nonexistent video status = %d, want %d", askNotFoundResp.StatusCode, http.StatusNotFound)
+	}
+
+	// 400 asking with an empty question.
+	emptyQuestionBody, _ := json.Marshal(map[string]string{"question": ""})
+	askEmptyResp, err := http.Post(srv.URL+"/api/videos/"+video.ID+"/ask", "application/json", bytes.NewReader(emptyQuestionBody))
+	if err != nil {
+		t.Fatalf("POST ask empty question: %v", err)
+	}
+	askEmptyResp.Body.Close()
+	if askEmptyResp.StatusCode != http.StatusBadRequest {
+		t.Errorf("ask empty question status = %d, want %d", askEmptyResp.StatusCode, http.StatusBadRequest)
+	}
+
+	// 409 asking about a video that hasn't finished processing yet. Relies on
+	// the background ingestion goroutine not having finished by the time the
+	// ask call fires a few milliseconds after submit returns — true for this
+	// short fixture video today (confirmed: ingestion takes ~2s, this call
+	// fires within milliseconds of the 202), but a timing assumption, not a
+	// guarantee. Revisit if this ever flakes.
+	submitBody, _ := json.Marshal(map[string]string{"video_url": liveTestVideo, "lang": "en", "user_id": userID})
+	submitResp, err := http.Post(srv.URL+"/api/videos", "application/json", bytes.NewReader(submitBody))
+	if err != nil {
+		t.Fatalf("POST /api/videos (for not-ready check): %v", err)
+	}
+	var pendingVideo models.Video
+	decodeErr := json.NewDecoder(submitResp.Body).Decode(&pendingVideo)
+	submitResp.Body.Close()
+	if decodeErr != nil {
+		t.Fatalf("decode second submit response: %v", decodeErr)
+	}
+	defer db.Exec(context.Background(), `DELETE FROM videos WHERE id = $1`, pendingVideo.ID)
+
+	askNotReadyResp, err := http.Post(srv.URL+"/api/videos/"+pendingVideo.ID+"/ask", "application/json", bytes.NewReader(askBody))
+	if err != nil {
+		t.Fatalf("POST ask not-ready video: %v", err)
+	}
+	askNotReadyResp.Body.Close()
+	if askNotReadyResp.StatusCode != http.StatusConflict {
+		t.Errorf("ask not-ready video status = %d, want %d", askNotReadyResp.StatusCode, http.StatusConflict)
 	}
 }

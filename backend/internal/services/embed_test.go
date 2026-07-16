@@ -9,8 +9,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/openai/openai-go/v3/option"
 	"github.com/joho/godotenv"
+	"github.com/openai/openai-go/v3/option"
 )
 
 // Verifies the request is batched (all chunk texts in one call) and the

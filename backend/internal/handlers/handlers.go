@@ -17,8 +17,8 @@ import (
 // call (Supadata/OpenAI) can't leave a goroutine running forever.
 const processTimeout = 10 * time.Minute
 
-// VideoHandler serves the video ingestion HTTP endpoints, wrapping the DB
-// and the external service clients the async pipeline needs.
+// VideoHandler serves the video ingestion and Q&A HTTP endpoints, wrapping
+// the DB and the external service clients the async pipeline and Q&A need.
 type VideoHandler struct {
 	db               *database.DB
 	transcriptClient *services.Client
@@ -112,6 +112,54 @@ func (h *VideoHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, video)
+}
+
+// askRequest is the JSON body for POST /api/videos/{id}/ask.
+type askRequest struct {
+	Question string `json:"question"`
+}
+
+// askResponse is the JSON body returned by HandleAsk.
+type askResponse struct {
+	Answer  string            `json:"answer"`
+	Sources []services.Source `json:"sources"`
+}
+
+// HandleAsk answers a question about one video's content, grounded in its
+// stored transcript chunks, with timestamp citations.
+func (h *VideoHandler) HandleAsk(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var req askRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Question == "" {
+		writeError(w, http.StatusBadRequest, "question is required")
+		return
+	}
+
+	answer, err := services.AnswerQuestion(r.Context(), h.db, h.embedClient, id, req.Question)
+	if errors.Is(err, database.ErrVideoNotFound) {
+		writeError(w, http.StatusNotFound, "video not found")
+		return
+	}
+	if errors.Is(err, database.ErrInvalidID) {
+		writeError(w, http.StatusBadRequest, "invalid video id")
+		return
+	}
+	if errors.Is(err, services.ErrVideoNotReady) {
+		writeError(w, http.StatusConflict, "video is not ready for questions")
+		return
+	}
+	if err != nil {
+		log.Printf("answer question for video %s: %v", id, err)
+		writeError(w, http.StatusInternalServerError, "failed to answer question")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, askResponse{Answer: answer.Text, Sources: answer.Sources})
 }
 
 // writeJSON encodes v as the JSON response body with the given status code.

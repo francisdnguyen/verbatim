@@ -108,6 +108,37 @@ func (db *DB) GetVideo(ctx context.Context, videoID string) (models.Video, error
 	return v, nil
 }
 
+// SearchSimilarChunks returns the limit chunks of one video whose embeddings
+// are closest (cosine distance) to queryEmbedding, closest first — the
+// context retrieved for a Q&A request.
+func (db *DB) SearchSimilarChunks(ctx context.Context, videoID string, queryEmbedding []float32, limit int) ([]models.Chunk, error) {
+	rows, err := db.Query(ctx,
+		`SELECT id, video_id, chunk_index, chunk_text, start_seconds, end_seconds, created_at
+		 FROM chunks
+		 WHERE video_id = $1
+		 ORDER BY embedding <=> $2
+		 LIMIT $3`,
+		videoID, pgvector.NewVector(queryEmbedding), limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search similar chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var chunks []models.Chunk
+	for rows.Next() {
+		var c models.Chunk
+		if err := rows.Scan(&c.ID, &c.VideoID, &c.ChunkIndex, &c.ChunkText, &c.StartSeconds, &c.EndSeconds, &c.CreatedAt); err != nil {
+			return nil, fmt.Errorf("search similar chunks: scan: %w", err)
+		}
+		chunks = append(chunks, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("search similar chunks: %w", err)
+	}
+	return chunks, nil
+}
+
 // UpdateVideoStatus transitions a video's status (processing/ready/failed).
 func (db *DB) UpdateVideoStatus(ctx context.Context, videoID string, status models.VideoStatus) error {
 	_, err := db.Exec(ctx, `UPDATE videos SET status = $1 WHERE id = $2`, status, videoID)

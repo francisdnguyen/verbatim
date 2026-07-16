@@ -48,6 +48,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/videos", videoHandler.HandleSubmit)
 	mux.HandleFunc("GET /api/videos/{id}", videoHandler.HandleStatus)
+	mux.HandleFunc("POST /api/videos/{id}/ask", videoHandler.HandleAsk)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -55,7 +56,8 @@ func main() {
 	}
 
 	log.Printf("Listening on :%s", port)
-	log.Println("  POST /api/videos       - submit a YouTube video for ingestion")
-	log.Println("  GET  /api/videos/{id}  - poll a video's ingestion status")
+	log.Println("  POST /api/videos           - submit a YouTube video for ingestion")
+	log.Println("  GET  /api/videos/{id}      - poll a video's ingestion status")
+	log.Println("  POST /api/videos/{id}/ask  - ask a question about a video")
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }
