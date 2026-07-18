@@ -4,12 +4,14 @@ import type { AuthResponse } from '../types'
 
 interface AuthFormProps {
   onAuthenticated: (auth: AuthResponse) => void
+  initialMode?: 'login' | 'register'
+  onBack?: () => void
 }
 
 type Mode = 'login' | 'register'
 
-function AuthForm({ onAuthenticated }: AuthFormProps) {
-  const [mode, setMode] = useState<Mode>('login')
+function AuthForm({ onAuthenticated, initialMode = 'login', onBack }: AuthFormProps) {
+  const [mode, setMode] = useState<Mode>(initialMode)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -37,6 +39,12 @@ function AuthForm({ onAuthenticated }: AuthFormProps) {
 
   return (
     <div className="mx-auto max-w-md w-full">
+      {onBack && (
+        <button type="button" onClick={onBack} className="text-sm mb-4 underline">
+          ← Back
+        </button>
+      )}
+
       <div className="flex gap-2 mb-4">
         <button
           type="button"
