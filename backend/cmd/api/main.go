@@ -34,6 +34,10 @@ func main() {
 	if s3Bucket == "" {
 		log.Fatal("AWS_S3_BUCKET is not set")
 	}
+	frontendOrigin := os.Getenv("FRONTEND_ORIGIN")
+	if frontendOrigin == "" {
+		frontendOrigin = "http://localhost:5173"
+	}
 
 	ctx := context.Background()
 
@@ -58,6 +62,7 @@ func main() {
 	mux.HandleFunc("GET /api/videos/{id}", videoHandler.HandleStatus)
 	mux.HandleFunc("POST /api/videos/{id}/ask", videoHandler.HandleAsk)
 	mux.HandleFunc("POST /api/videos/upload", videoHandler.HandleUpload)
+	mux.HandleFunc("POST /api/demo-user", handlers.HandleDemoUser(db))
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -69,5 +74,6 @@ func main() {
 	log.Println("  POST /api/videos/upload    - upload a video/audio file for ingestion")
 	log.Println("  GET  /api/videos/{id}      - poll a video's ingestion status")
 	log.Println("  POST /api/videos/{id}/ask  - ask a question about a video")
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Println("  POST /api/demo-user        - get or create the demo user")
+	log.Fatal(http.ListenAndServe(":"+port, handlers.CorsMiddleware(frontendOrigin, mux)))
 }

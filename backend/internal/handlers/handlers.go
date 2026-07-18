@@ -256,6 +256,41 @@ func (h *VideoHandler) HandleAsk(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, askResponse{Answer: answer.Text, Sources: answer.Sources})
 }
 
+// HandleDemoUser upserts and returns the single fixed demo user, letting the
+// frontend auto-provision a real user row to submit videos against without
+// any login UI — a standalone function (not a VideoHandler method) since it
+// only needs the DB, not the transcript/OpenAI/S3 clients.
+func HandleDemoUser(db *database.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, err := db.GetOrCreateDemoUser(r.Context())
+		if err != nil {
+			log.Printf("get or create demo user: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to provision demo user")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"id": user.ID, "email": user.Email})
+	}
+}
+
+// CorsMiddleware allows cross-origin requests from allowedOrigin (the
+// frontend dev server or, in production, the deployed Vercel origin) and
+// answers the browser's preflight OPTIONS request directly, since the mux
+// has no route registered for it otherwise.
+func CorsMiddleware(allowedOrigin string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // writeJSON encodes v as the JSON response body with the given status code.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

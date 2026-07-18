@@ -69,6 +69,28 @@ func Connect(ctx context.Context, databaseURL string) (*DB, error) {
 	return &DB{Pool: pool}, nil
 }
 
+// demoUserEmail identifies the single fixed demo user the frontend
+// auto-provisions in place of real auth (deferred to Phase 2).
+const demoUserEmail = "demo@verbatim.local"
+
+// GetOrCreateDemoUser upserts the one fixed demo user by email, so repeated
+// calls (e.g. every frontend page load) return the same row instead of
+// creating duplicates. password_hash is a placeholder — there's no real
+// auth yet to hash a password against.
+func (db *DB) GetOrCreateDemoUser(ctx context.Context) (models.User, error) {
+	var u models.User
+	err := db.QueryRow(ctx,
+		`INSERT INTO users (email, password_hash) VALUES ($1, $2)
+		 ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+		 RETURNING id, email, created_at`,
+		demoUserEmail, "demo-user-no-auth",
+	).Scan(&u.ID, &u.Email, &u.CreatedAt)
+	if err != nil {
+		return models.User{}, fmt.Errorf("get or create demo user: %w", err)
+	}
+	return u, nil
+}
+
 // CreateVideo inserts a new YouTube-sourced video row (status starts 'pending').
 func (db *DB) CreateVideo(ctx context.Context, userID, sourceURL string) (models.Video, error) {
 	var v models.Video
