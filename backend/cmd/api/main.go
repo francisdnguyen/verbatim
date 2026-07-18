@@ -10,6 +10,7 @@ import (
 
 	"verbatim/backend/internal/database"
 	"verbatim/backend/internal/handlers"
+	"verbatim/backend/internal/middleware"
 	"verbatim/backend/internal/services"
 )
 
@@ -38,6 +39,10 @@ func main() {
 	if frontendOrigin == "" {
 		frontendOrigin = "http://localhost:5173"
 	}
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		log.Fatal("JWT_SECRET is not set")
+	}
 
 	ctx := context.Background()
 
@@ -55,14 +60,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	authService := services.NewAuthService(jwtSecret)
 	videoHandler := handlers.NewVideoHandler(db, transcriptClient, openAIClient, s3Client)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/videos", videoHandler.HandleSubmit)
-	mux.HandleFunc("GET /api/videos/{id}", videoHandler.HandleStatus)
-	mux.HandleFunc("POST /api/videos/{id}/ask", videoHandler.HandleAsk)
-	mux.HandleFunc("POST /api/videos/upload", videoHandler.HandleUpload)
-	mux.HandleFunc("POST /api/demo-user", handlers.HandleDemoUser(db))
+	authMW := middleware.AuthMiddleware(authService)
+	mux.Handle("POST /api/videos", authMW(http.HandlerFunc(videoHandler.HandleSubmit)))
+	mux.Handle("GET /api/videos/{id}", authMW(http.HandlerFunc(videoHandler.HandleStatus)))
+	mux.Handle("POST /api/videos/{id}/ask", authMW(http.HandlerFunc(videoHandler.HandleAsk)))
+	mux.Handle("POST /api/videos/upload", authMW(http.HandlerFunc(videoHandler.HandleUpload)))
+	mux.HandleFunc("POST /api/auth/register", handlers.HandleRegister(db, authService))
+	mux.HandleFunc("POST /api/auth/login", handlers.HandleLogin(db, authService))
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -70,10 +78,11 @@ func main() {
 	}
 
 	log.Printf("Listening on :%s", port)
-	log.Println("  POST /api/videos           - submit a YouTube video for ingestion")
-	log.Println("  POST /api/videos/upload    - upload a video/audio file for ingestion")
-	log.Println("  GET  /api/videos/{id}      - poll a video's ingestion status")
-	log.Println("  POST /api/videos/{id}/ask  - ask a question about a video")
-	log.Println("  POST /api/demo-user        - get or create the demo user")
+	log.Println("  POST /api/auth/register    - create a new user account")
+	log.Println("  POST /api/auth/login       - log in and receive a token")
+	log.Println("  POST /api/videos           - submit a YouTube video for ingestion (auth required)")
+	log.Println("  POST /api/videos/upload    - upload a video/audio file for ingestion (auth required)")
+	log.Println("  GET  /api/videos/{id}      - poll a video's ingestion status (auth required)")
+	log.Println("  POST /api/videos/{id}/ask  - ask a question about a video (auth required)")
 	log.Fatal(http.ListenAndServe(":"+port, handlers.CorsMiddleware(frontendOrigin, mux)))
 }

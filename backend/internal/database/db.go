@@ -23,9 +23,14 @@ var ErrVideoNotFound = errors.New("video not found")
 // formatted UUID, so callers can return a 400 instead of a generic 500.
 var ErrInvalidID = errors.New("invalid id")
 
-// ErrUserNotFound is returned when a video is created for a user_id that
-// doesn't exist, so callers can return a 400 instead of a generic 500.
+// ErrUserNotFound is returned when a referenced or looked-up user doesn't
+// exist — a video created for a nonexistent user_id, or no row matching a
+// login attempt's email — so callers can return a 4xx instead of a generic 500.
 var ErrUserNotFound = errors.New("user not found")
+
+// ErrEmailTaken is returned when CreateUser is called with an email that
+// already has a row, so callers can return a 409 instead of a generic 500.
+var ErrEmailTaken = errors.New("email already registered")
 
 // pgErrorCode returns err's Postgres error code (e.g. "23503"), or "" if err
 // isn't a *pgconn.PgError.
@@ -69,24 +74,40 @@ func Connect(ctx context.Context, databaseURL string) (*DB, error) {
 	return &DB{Pool: pool}, nil
 }
 
-// demoUserEmail identifies the single fixed demo user the frontend
-// auto-provisions in place of real auth (deferred to Phase 2).
-const demoUserEmail = "demo@verbatim.local"
-
-// GetOrCreateDemoUser upserts the one fixed demo user by email, so repeated
-// calls (e.g. every frontend page load) return the same row instead of
-// creating duplicates. password_hash is a placeholder — there's no real
-// auth yet to hash a password against.
-func (db *DB) GetOrCreateDemoUser(ctx context.Context) (models.User, error) {
+// CreateUser inserts a new user row with an already-hashed password. Unlike
+// the demo-user placeholder this replaces, it's a real insert, not an
+// upsert — registration must reject a duplicate email, not silently reuse
+// the existing row.
+func (db *DB) CreateUser(ctx context.Context, email, passwordHash string) (models.User, error) {
 	var u models.User
 	err := db.QueryRow(ctx,
 		`INSERT INTO users (email, password_hash) VALUES ($1, $2)
-		 ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
 		 RETURNING id, email, created_at`,
-		demoUserEmail, "demo-user-no-auth",
+		email, passwordHash,
 	).Scan(&u.ID, &u.Email, &u.CreatedAt)
+	if pgErrorCode(err) == "23505" { // unique_violation: email already has a row
+		return models.User{}, ErrEmailTaken
+	}
 	if err != nil {
-		return models.User{}, fmt.Errorf("get or create demo user: %w", err)
+		return models.User{}, fmt.Errorf("create user: %w", err)
+	}
+	return u, nil
+}
+
+// GetUserByEmail looks up a user by email, returning ErrUserNotFound if no
+// such row exists. The only caller (login) needs password_hash, so this is
+// the one place outside CreateUser that column is ever read.
+func (db *DB) GetUserByEmail(ctx context.Context, email string) (models.User, error) {
+	var u models.User
+	err := db.QueryRow(ctx,
+		`SELECT id, email, password_hash, created_at FROM users WHERE email = $1`,
+		email,
+	).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return models.User{}, ErrUserNotFound
+	}
+	if err != nil {
+		return models.User{}, fmt.Errorf("get user by email: %w", err)
 	}
 	return u, nil
 }

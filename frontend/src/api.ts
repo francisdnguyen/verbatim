@@ -1,29 +1,42 @@
 import axios from 'axios'
-import type { AskResponse, Video } from './types'
+import type { AskResponse, AuthResponse, Video } from './types'
+
+export const TOKEN_STORAGE_KEY = 'verbatim_token'
 
 const client = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080',
 })
 
-export async function getOrCreateDemoUser(): Promise<{ id: string; email: string }> {
-  const { data } = await client.post('/api/demo-user')
+client.interceptors.request.use((config) => {
+  const token = localStorage.getItem(TOKEN_STORAGE_KEY)
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+export async function register(email: string, password: string): Promise<AuthResponse> {
+  const { data } = await client.post('/api/auth/register', { email, password })
   return data
 }
 
-export async function submitYouTubeVideo(videoUrl: string, lang: string, userId: string): Promise<Video> {
+export async function login(email: string, password: string): Promise<AuthResponse> {
+  const { data } = await client.post('/api/auth/login', { email, password })
+  return data
+}
+
+export async function submitYouTubeVideo(videoUrl: string, lang: string): Promise<Video> {
   const { data } = await client.post('/api/videos', {
     video_url: videoUrl,
     lang,
-    user_id: userId,
   })
   return data
 }
 
-export async function uploadVideo(file: File, lang: string, userId: string): Promise<Video> {
+export async function uploadVideo(file: File, lang: string): Promise<Video> {
   const form = new FormData()
   form.append('file', file)
   form.append('lang', lang)
-  form.append('user_id', userId)
   const { data } = await client.post('/api/videos/upload', form)
   return data
 }

@@ -8,9 +8,11 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"verbatim/backend/internal/database"
+	"verbatim/backend/internal/middleware"
 	"verbatim/backend/internal/models"
 	"verbatim/backend/internal/services"
 )
@@ -37,13 +39,11 @@ func NewVideoHandler(db *database.DB, transcriptClient *services.Client, openAIC
 	return &VideoHandler{db: db, transcriptClient: transcriptClient, openAIClient: openAIClient, s3Client: s3Client}
 }
 
-// submitRequest is the JSON body for POST /api/videos. user_id is a plain
-// request field (not derived from auth) because JWT auth hasn't landed yet
-// — Phase 2 replaces this with the authenticated caller's ID.
+// submitRequest is the JSON body for POST /api/videos. The owning user comes
+// from the authenticated caller (see middleware.AuthMiddleware), not the body.
 type submitRequest struct {
 	VideoURL string `json:"video_url"`
 	Lang     string `json:"lang"`
-	UserID   string `json:"user_id"`
 }
 
 // HandleSubmit creates a pending video row and returns immediately, then
@@ -55,14 +55,18 @@ func (h *VideoHandler) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.VideoURL == "" || req.Lang == "" || req.UserID == "" {
-		writeError(w, http.StatusBadRequest, "video_url, lang, and user_id are all required")
+	if req.VideoURL == "" || req.Lang == "" {
+		writeError(w, http.StatusBadRequest, "video_url and lang are required")
 		return
 	}
+	userID, _ := middleware.GetUserID(r)
 
-	video, err := h.db.CreateVideo(r.Context(), req.UserID, req.VideoURL)
+	video, err := h.db.CreateVideo(r.Context(), userID, req.VideoURL)
 	if errors.Is(err, database.ErrUserNotFound) {
-		writeError(w, http.StatusBadRequest, "user_id does not exist")
+		// Practically unreachable through this route now — a valid token
+		// always has a real backing user row — but left as defensive
+		// coverage for a token whose user was deleted after issuance.
+		writeError(w, http.StatusUnauthorized, "authenticated user no longer exists")
 		return
 	}
 	if err != nil {
@@ -116,12 +120,8 @@ func (h *VideoHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := r.FormValue("user_id")
 	lang := r.FormValue("lang")
-	if userID == "" {
-		writeError(w, http.StatusBadRequest, "user_id is required")
-		return
-	}
+	userID, _ := middleware.GetUserID(r)
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
@@ -144,14 +144,17 @@ func (h *VideoHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
 
 	video, err := h.db.CreateUploadedVideo(r.Context(), userID, s3Key, header.Filename)
 	if errors.Is(err, database.ErrUserNotFound) {
-		// The file already made it to S3 before we knew user_id was bad —
-		// clean it up rather than leaving an orphaned object with no video
-		// row to ever reference it. Best-effort: log, don't fail the
-		// response over a cleanup failure.
+		// Practically unreachable now that userID comes from a validated
+		// token rather than a client-supplied field — left as defensive
+		// coverage for a token whose user was deleted after issuance. The
+		// file already made it to S3 before this was known, so clean it up
+		// rather than leaving an orphaned object with no video row to ever
+		// reference it. Best-effort: log, don't fail the response over a
+		// cleanup failure.
 		if delErr := h.s3Client.DeleteObject(context.Background(), s3Key); delErr != nil {
 			log.Printf("upload video: cleanup orphaned s3 object %s: %v", s3Key, delErr)
 		}
-		writeError(w, http.StatusBadRequest, "user_id does not exist")
+		writeError(w, http.StatusUnauthorized, "authenticated user no longer exists")
 		return
 	}
 	if err != nil {
@@ -204,6 +207,13 @@ func (h *VideoHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to look up video")
 		return
 	}
+	if callerID, _ := middleware.GetUserID(r); video.UserID != callerID {
+		// 404, not 403: confirming a non-owner's guessed UUID is real would
+		// leak the video's existence. Treating "not yours" the same as
+		// "doesn't exist" keeps video IDs unenumerable by non-owners.
+		writeError(w, http.StatusNotFound, "video not found")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, video)
 }
@@ -234,6 +244,29 @@ func (h *VideoHandler) HandleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Look up the video first, purely to gate on ownership before spending
+	// an OpenAI call on a request that's about to be rejected —
+	// AnswerQuestion does its own internal lookup too, a small deliberate
+	// extra round-trip rather than threading the caller ID through it.
+	video, err := h.db.GetVideo(r.Context(), id)
+	if errors.Is(err, database.ErrVideoNotFound) {
+		writeError(w, http.StatusNotFound, "video not found")
+		return
+	}
+	if errors.Is(err, database.ErrInvalidID) {
+		writeError(w, http.StatusBadRequest, "invalid video id")
+		return
+	}
+	if err != nil {
+		log.Printf("answer question for video %s: %v", id, err)
+		writeError(w, http.StatusInternalServerError, "failed to answer question")
+		return
+	}
+	if callerID, _ := middleware.GetUserID(r); video.UserID != callerID {
+		writeError(w, http.StatusNotFound, "video not found")
+		return
+	}
+
 	answer, err := services.AnswerQuestion(r.Context(), h.db, h.openAIClient, id, req.Question)
 	if errors.Is(err, database.ErrVideoNotFound) {
 		writeError(w, http.StatusNotFound, "video not found")
@@ -256,19 +289,127 @@ func (h *VideoHandler) HandleAsk(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, askResponse{Answer: answer.Text, Sources: answer.Sources})
 }
 
-// HandleDemoUser upserts and returns the single fixed demo user, letting the
-// frontend auto-provision a real user row to submit videos against without
-// any login UI — a standalone function (not a VideoHandler method) since it
-// only needs the DB, not the transcript/OpenAI/S3 clients.
-func HandleDemoUser(db *database.DB) http.HandlerFunc {
+// registerRequest is the JSON body for POST /api/auth/register.
+type registerRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// loginRequest is the JSON body for POST /api/auth/login.
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// authResponse is the JSON body returned by HandleRegister/HandleLogin.
+// models.User.PasswordHash already carries json:"-", so it's never
+// serialized here — nothing to scrub manually.
+type authResponse struct {
+	Token string      `json:"token"`
+	User  models.User `json:"user"`
+}
+
+// minPasswordLength is the minimum acceptable length for a new password —
+// a basic sanity floor, not a full password-strength policy.
+const minPasswordLength = 8
+
+// normalizeEmail trims whitespace and lowercases an email so that
+// "Foo@x.com" and " foo@x.com " register/look up as the same account —
+// neither Postgres's UNIQUE constraint nor a plain WHERE lookup does this
+// for you.
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// HandleRegister creates a new user and returns a token for it — a
+// standalone function (not a VideoHandler method) since it only needs the
+// DB and auth service, not the video-specific clients.
+func HandleRegister(db *database.DB, authService *services.AuthService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		user, err := db.GetOrCreateDemoUser(r.Context())
-		if err != nil {
-			log.Printf("get or create demo user: %v", err)
-			writeError(w, http.StatusInternalServerError, "failed to provision demo user")
+		var req registerRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"id": user.ID, "email": user.Email})
+		if req.Email == "" || req.Password == "" {
+			writeError(w, http.StatusBadRequest, "email and password are required")
+			return
+		}
+		if len(req.Password) < minPasswordLength {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("password must be at least %d characters", minPasswordLength))
+			return
+		}
+		email := normalizeEmail(req.Email)
+
+		passwordHash, err := authService.HashPassword(req.Password)
+		if err != nil {
+			log.Printf("register: hash password: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to register")
+			return
+		}
+
+		user, err := db.CreateUser(r.Context(), email, passwordHash)
+		if errors.Is(err, database.ErrEmailTaken) {
+			writeError(w, http.StatusConflict, "email already registered")
+			return
+		}
+		if err != nil {
+			log.Printf("register: create user: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to register")
+			return
+		}
+
+		token, err := authService.GenerateToken(user.ID, user.Email)
+		if err != nil {
+			log.Printf("register: generate token: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to register")
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, authResponse{Token: token, User: user})
+	}
+}
+
+// HandleLogin authenticates a user and returns a token for it — a
+// standalone function for the same reason as HandleRegister.
+func HandleLogin(db *database.DB, authService *services.AuthService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req loginRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if req.Email == "" || req.Password == "" {
+			writeError(w, http.StatusBadRequest, "email and password are required")
+			return
+		}
+
+		user, err := db.GetUserByEmail(r.Context(), normalizeEmail(req.Email))
+		if errors.Is(err, database.ErrUserNotFound) {
+			// Deliberately the same response as a wrong password below —
+			// distinguishing "no such user" from "wrong password" would let
+			// a caller enumerate registered emails.
+			writeError(w, http.StatusUnauthorized, "invalid email or password")
+			return
+		}
+		if err != nil {
+			log.Printf("login: get user by email: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to log in")
+			return
+		}
+		if !authService.CheckPassword(user.PasswordHash, req.Password) {
+			writeError(w, http.StatusUnauthorized, "invalid email or password")
+			return
+		}
+
+		token, err := authService.GenerateToken(user.ID, user.Email)
+		if err != nil {
+			log.Printf("login: generate token: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to log in")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, authResponse{Token: token, User: user})
 	}
 }
 
@@ -280,7 +421,7 @@ func CorsMiddleware(allowedOrigin string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

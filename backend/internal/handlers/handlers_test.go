@@ -18,6 +18,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"verbatim/backend/internal/database"
+	"verbatim/backend/internal/middleware"
 	"verbatim/backend/internal/models"
 	"verbatim/backend/internal/services"
 )
@@ -25,19 +26,76 @@ import (
 // liveTestVideo is the same fixture URL used by the other live tests in this codebase.
 const liveTestVideo = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 
-// newTestServer wires a VideoHandler behind the same routes main.go registers.
+// testJWTSecret signs tokens for these tests only — never used for anything
+// resembling a real deployment secret.
+const testJWTSecret = "test-secret-not-for-production"
+
+// newTestServer wires a VideoHandler behind the same routes main.go
+// registers, including the auth-middleware wrapping on the 4 video routes.
 // s3Client may be a client for a bucket that doesn't actually get used
 // (harmless for tests that never hit HandleUpload) — services.NewS3Client
 // doesn't validate credentials/bucket existence eagerly.
-func newTestServer(t *testing.T, db *database.DB, supadataKey, openaiKey string, s3Client *services.S3Client) *httptest.Server {
+func newTestServer(t *testing.T, db *database.DB, supadataKey, openaiKey string, s3Client *services.S3Client, authService *services.AuthService) *httptest.Server {
 	t.Helper()
 	h := NewVideoHandler(db, services.NewClient(supadataKey), services.NewOpenAIClient(openaiKey), s3Client)
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/videos", h.HandleSubmit)
-	mux.HandleFunc("GET /api/videos/{id}", h.HandleStatus)
-	mux.HandleFunc("POST /api/videos/{id}/ask", h.HandleAsk)
-	mux.HandleFunc("POST /api/videos/upload", h.HandleUpload)
+	authMW := middleware.AuthMiddleware(authService)
+	mux.Handle("POST /api/videos", authMW(http.HandlerFunc(h.HandleSubmit)))
+	mux.Handle("GET /api/videos/{id}", authMW(http.HandlerFunc(h.HandleStatus)))
+	mux.Handle("POST /api/videos/{id}/ask", authMW(http.HandlerFunc(h.HandleAsk)))
+	mux.Handle("POST /api/videos/upload", authMW(http.HandlerFunc(h.HandleUpload)))
 	return httptest.NewServer(mux)
+}
+
+// createTestUser upserts a test user by email and returns its ID —
+// consolidates what used to be an identical raw-SQL block repeated at every
+// call site in this file.
+func createTestUser(t *testing.T, db *database.DB, email string) string {
+	t.Helper()
+	var userID string
+	err := db.QueryRow(context.Background(),
+		`INSERT INTO users (email, password_hash) VALUES ($1, $2)
+		 ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+		 RETURNING id`,
+		email, "test-hash",
+	).Scan(&userID)
+	if err != nil {
+		t.Fatalf("upsert test user %s: %v", email, err)
+	}
+	return userID
+}
+
+// testAuthToken issues a real token for userID/email via the same
+// AuthService the test server validates against — bypasses HandleLogin/
+// plaintext passwords entirely, since these tests exercise video/ask
+// behavior, not the login flow itself (which has its own tests).
+func testAuthToken(t *testing.T, authService *services.AuthService, userID, email string) string {
+	t.Helper()
+	token, err := authService.GenerateToken(userID, email)
+	if err != nil {
+		t.Fatalf("generate test token: %v", err)
+	}
+	return token
+}
+
+// doRequest sends method/url with an Authorization: Bearer token header —
+// a helper because http.Post/http.Get don't support custom headers, and
+// every call in this file now needs one.
+func doRequest(t *testing.T, method, url, token string, body io.Reader, contentType string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	return resp
 }
 
 // TestVideoHandlers_Live drives HandleSubmit and HandleStatus over real HTTP
@@ -61,31 +119,21 @@ func TestVideoHandlers_Live(t *testing.T) {
 	}
 	defer db.Close()
 
-	var userID string
-	err = db.QueryRow(ctx,
-		`INSERT INTO users (email, password_hash) VALUES ($1, $2)
-		 ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-		 RETURNING id`,
-		"handlers-test@example.com", "test-hash",
-	).Scan(&userID)
-	if err != nil {
-		t.Fatalf("upsert test user: %v", err)
-	}
+	authService := services.NewAuthService(testJWTSecret)
+	userID := createTestUser(t, db, "handlers-test@example.com")
+	token := testAuthToken(t, authService, userID, "handlers-test@example.com")
 
 	s3Client, err := services.NewS3Client(ctx, os.Getenv("AWS_S3_BUCKET"))
 	if err != nil {
 		t.Fatalf("new s3 client: %v", err)
 	}
 
-	srv := newTestServer(t, db, supadataKey, openaiKey, s3Client)
+	srv := newTestServer(t, db, supadataKey, openaiKey, s3Client, authService)
 	defer srv.Close()
 
 	// Submit: should return 202 immediately with status=pending.
-	body, _ := json.Marshal(map[string]string{"video_url": liveTestVideo, "lang": "en", "user_id": userID})
-	resp, err := http.Post(srv.URL+"/api/videos", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("POST /api/videos: %v", err)
-	}
+	body, _ := json.Marshal(map[string]string{"video_url": liveTestVideo, "lang": "en"})
+	resp := doRequest(t, "POST", srv.URL+"/api/videos", token, bytes.NewReader(body), "application/json")
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("submit status = %d, want %d", resp.StatusCode, http.StatusAccepted)
@@ -105,10 +153,7 @@ func TestVideoHandlers_Live(t *testing.T) {
 	deadline := time.Now().Add(30 * time.Second)
 	var finalStatus models.VideoStatus
 	for time.Now().Before(deadline) {
-		statusResp, err := http.Get(srv.URL + "/api/videos/" + video.ID)
-		if err != nil {
-			t.Fatalf("GET /api/videos/{id}: %v", err)
-		}
+		statusResp := doRequest(t, "GET", srv.URL+"/api/videos/"+video.ID, token, nil, "")
 		var polled models.Video
 		decodeErr := json.NewDecoder(statusResp.Body).Decode(&polled)
 		statusResp.Body.Close()
@@ -137,20 +182,14 @@ func TestVideoHandlers_Live(t *testing.T) {
 	}
 
 	// 404 for a well-formed but nonexistent video ID.
-	notFoundResp, err := http.Get(srv.URL + "/api/videos/00000000-0000-0000-0000-000000000000")
-	if err != nil {
-		t.Fatalf("GET nonexistent video: %v", err)
-	}
+	notFoundResp := doRequest(t, "GET", srv.URL+"/api/videos/00000000-0000-0000-0000-000000000000", token, nil, "")
 	notFoundResp.Body.Close()
 	if notFoundResp.StatusCode != http.StatusNotFound {
 		t.Errorf("nonexistent video status = %d, want %d", notFoundResp.StatusCode, http.StatusNotFound)
 	}
 
 	// 400 for a malformed video ID.
-	badIDResp, err := http.Get(srv.URL + "/api/videos/not-a-uuid")
-	if err != nil {
-		t.Fatalf("GET malformed video id: %v", err)
-	}
+	badIDResp := doRequest(t, "GET", srv.URL+"/api/videos/not-a-uuid", token, nil, "")
 	badIDResp.Body.Close()
 	if badIDResp.StatusCode != http.StatusBadRequest {
 		t.Errorf("malformed id status = %d, want %d", badIDResp.StatusCode, http.StatusBadRequest)
@@ -158,32 +197,26 @@ func TestVideoHandlers_Live(t *testing.T) {
 
 	// 400 for a missing field.
 	badBody, _ := json.Marshal(map[string]string{"video_url": liveTestVideo})
-	badResp, err := http.Post(srv.URL+"/api/videos", "application/json", bytes.NewReader(badBody))
-	if err != nil {
-		t.Fatalf("POST missing fields: %v", err)
-	}
+	badResp := doRequest(t, "POST", srv.URL+"/api/videos", token, bytes.NewReader(badBody), "application/json")
 	badResp.Body.Close()
 	if badResp.StatusCode != http.StatusBadRequest {
 		t.Errorf("missing-fields status = %d, want %d", badResp.StatusCode, http.StatusBadRequest)
 	}
 
-	// 400 for a well-formed but nonexistent user_id.
-	badUserBody, _ := json.Marshal(map[string]string{"video_url": liveTestVideo, "lang": "en", "user_id": "00000000-0000-0000-0000-000000000000"})
-	badUserResp, err := http.Post(srv.URL+"/api/videos", "application/json", bytes.NewReader(badUserBody))
+	// 401 with no Authorization header at all.
+	noAuthReq, _ := http.NewRequest("GET", srv.URL+"/api/videos/"+video.ID, nil)
+	noAuthResp, err := http.DefaultClient.Do(noAuthReq)
 	if err != nil {
-		t.Fatalf("POST nonexistent user_id: %v", err)
+		t.Fatalf("GET without auth: %v", err)
 	}
-	badUserResp.Body.Close()
-	if badUserResp.StatusCode != http.StatusBadRequest {
-		t.Errorf("nonexistent user_id status = %d, want %d", badUserResp.StatusCode, http.StatusBadRequest)
+	noAuthResp.Body.Close()
+	if noAuthResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("no-auth status = %d, want %d", noAuthResp.StatusCode, http.StatusUnauthorized)
 	}
 
 	// Ask a real question about the now-ready video: 200 with a real answer and sources.
 	askBody, _ := json.Marshal(map[string]string{"question": "What is this video about?"})
-	askResp, err := http.Post(srv.URL+"/api/videos/"+video.ID+"/ask", "application/json", bytes.NewReader(askBody))
-	if err != nil {
-		t.Fatalf("POST ask: %v", err)
-	}
+	askResp := doRequest(t, "POST", srv.URL+"/api/videos/"+video.ID+"/ask", token, bytes.NewReader(askBody), "application/json")
 	defer askResp.Body.Close()
 	if askResp.StatusCode != http.StatusOK {
 		t.Fatalf("ask status = %d, want %d", askResp.StatusCode, http.StatusOK)
@@ -200,10 +233,7 @@ func TestVideoHandlers_Live(t *testing.T) {
 	}
 
 	// 404 asking about a nonexistent video.
-	askNotFoundResp, err := http.Post(srv.URL+"/api/videos/00000000-0000-0000-0000-000000000000/ask", "application/json", bytes.NewReader(askBody))
-	if err != nil {
-		t.Fatalf("POST ask nonexistent video: %v", err)
-	}
+	askNotFoundResp := doRequest(t, "POST", srv.URL+"/api/videos/00000000-0000-0000-0000-000000000000/ask", token, bytes.NewReader(askBody), "application/json")
 	askNotFoundResp.Body.Close()
 	if askNotFoundResp.StatusCode != http.StatusNotFound {
 		t.Errorf("ask nonexistent video status = %d, want %d", askNotFoundResp.StatusCode, http.StatusNotFound)
@@ -211,13 +241,28 @@ func TestVideoHandlers_Live(t *testing.T) {
 
 	// 400 asking with an empty question.
 	emptyQuestionBody, _ := json.Marshal(map[string]string{"question": ""})
-	askEmptyResp, err := http.Post(srv.URL+"/api/videos/"+video.ID+"/ask", "application/json", bytes.NewReader(emptyQuestionBody))
-	if err != nil {
-		t.Fatalf("POST ask empty question: %v", err)
-	}
+	askEmptyResp := doRequest(t, "POST", srv.URL+"/api/videos/"+video.ID+"/ask", token, bytes.NewReader(emptyQuestionBody), "application/json")
 	askEmptyResp.Body.Close()
 	if askEmptyResp.StatusCode != http.StatusBadRequest {
 		t.Errorf("ask empty question status = %d, want %d", askEmptyResp.StatusCode, http.StatusBadRequest)
+	}
+
+	// A second user's token must not be able to read or ask about the first
+	// user's video — 404 either way, not a real answer, confirming the
+	// ownership check added alongside JWT auth actually blocks cross-user access.
+	otherUserID := createTestUser(t, db, "handlers-test-other-user@example.com")
+	otherToken := testAuthToken(t, authService, otherUserID, "handlers-test-other-user@example.com")
+
+	otherStatusResp := doRequest(t, "GET", srv.URL+"/api/videos/"+video.ID, otherToken, nil, "")
+	otherStatusResp.Body.Close()
+	if otherStatusResp.StatusCode != http.StatusNotFound {
+		t.Errorf("other user's GET status = %d, want %d", otherStatusResp.StatusCode, http.StatusNotFound)
+	}
+
+	otherAskResp := doRequest(t, "POST", srv.URL+"/api/videos/"+video.ID+"/ask", otherToken, bytes.NewReader(askBody), "application/json")
+	otherAskResp.Body.Close()
+	if otherAskResp.StatusCode != http.StatusNotFound {
+		t.Errorf("other user's POST ask = %d, want %d", otherAskResp.StatusCode, http.StatusNotFound)
 	}
 
 	// 409 asking about a video that hasn't finished processing yet. Relies on
@@ -226,11 +271,8 @@ func TestVideoHandlers_Live(t *testing.T) {
 	// short fixture video today (confirmed: ingestion takes ~2s, this call
 	// fires within milliseconds of the 202), but a timing assumption, not a
 	// guarantee. Revisit if this ever flakes.
-	submitBody, _ := json.Marshal(map[string]string{"video_url": liveTestVideo, "lang": "en", "user_id": userID})
-	submitResp, err := http.Post(srv.URL+"/api/videos", "application/json", bytes.NewReader(submitBody))
-	if err != nil {
-		t.Fatalf("POST /api/videos (for not-ready check): %v", err)
-	}
+	submitBody, _ := json.Marshal(map[string]string{"video_url": liveTestVideo, "lang": "en"})
+	submitResp := doRequest(t, "POST", srv.URL+"/api/videos", token, bytes.NewReader(submitBody), "application/json")
 	var pendingVideo models.Video
 	decodeErr := json.NewDecoder(submitResp.Body).Decode(&pendingVideo)
 	submitResp.Body.Close()
@@ -239,10 +281,7 @@ func TestVideoHandlers_Live(t *testing.T) {
 	}
 	defer db.Exec(context.Background(), `DELETE FROM videos WHERE id = $1`, pendingVideo.ID)
 
-	askNotReadyResp, err := http.Post(srv.URL+"/api/videos/"+pendingVideo.ID+"/ask", "application/json", bytes.NewReader(askBody))
-	if err != nil {
-		t.Fatalf("POST ask not-ready video: %v", err)
-	}
+	askNotReadyResp := doRequest(t, "POST", srv.URL+"/api/videos/"+pendingVideo.ID+"/ask", token, bytes.NewReader(askBody), "application/json")
 	askNotReadyResp.Body.Close()
 	if askNotReadyResp.StatusCode != http.StatusConflict {
 		t.Errorf("ask not-ready video status = %d, want %d", askNotReadyResp.StatusCode, http.StatusConflict)
@@ -275,23 +314,16 @@ func TestVideoHandlers_Live_Upload(t *testing.T) {
 	}
 	defer db.Close()
 
-	var userID string
-	err = db.QueryRow(ctx,
-		`INSERT INTO users (email, password_hash) VALUES ($1, $2)
-		 ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-		 RETURNING id`,
-		"handlers-upload-test@example.com", "test-hash",
-	).Scan(&userID)
-	if err != nil {
-		t.Fatalf("upsert test user: %v", err)
-	}
+	authService := services.NewAuthService(testJWTSecret)
+	userID := createTestUser(t, db, "handlers-upload-test@example.com")
+	token := testAuthToken(t, authService, userID, "handlers-upload-test@example.com")
 
 	s3Client, err := services.NewS3Client(ctx, s3Bucket)
 	if err != nil {
 		t.Fatalf("new s3 client: %v", err)
 	}
 
-	srv := newTestServer(t, db, supadataKey, openaiKey, s3Client)
+	srv := newTestServer(t, db, supadataKey, openaiKey, s3Client, authService)
 	defer srv.Close()
 
 	fixturePath := filepath.Join("testdata", "sample-speech.wav")
@@ -303,9 +335,6 @@ func TestVideoHandlers_Live_Upload(t *testing.T) {
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	if err := writer.WriteField("user_id", userID); err != nil {
-		t.Fatalf("write user_id field: %v", err)
-	}
 	if err := writer.WriteField("lang", "en"); err != nil {
 		t.Fatalf("write lang field: %v", err)
 	}
@@ -320,10 +349,7 @@ func TestVideoHandlers_Live_Upload(t *testing.T) {
 		t.Fatalf("close multipart writer: %v", err)
 	}
 
-	resp, err := http.Post(srv.URL+"/api/videos/upload", writer.FormDataContentType(), &body)
-	if err != nil {
-		t.Fatalf("POST /api/videos/upload: %v", err)
-	}
+	resp := doRequest(t, "POST", srv.URL+"/api/videos/upload", token, &body, writer.FormDataContentType())
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("upload status = %d, want %d", resp.StatusCode, http.StatusAccepted)
@@ -346,10 +372,7 @@ func TestVideoHandlers_Live_Upload(t *testing.T) {
 	deadline := time.Now().Add(60 * time.Second)
 	var finalStatus models.VideoStatus
 	for time.Now().Before(deadline) {
-		statusResp, err := http.Get(srv.URL + "/api/videos/" + video.ID)
-		if err != nil {
-			t.Fatalf("GET /api/videos/{id}: %v", err)
-		}
+		statusResp := doRequest(t, "GET", srv.URL+"/api/videos/"+video.ID, token, nil, "")
 		var polled models.Video
 		decodeErr := json.NewDecoder(statusResp.Body).Decode(&polled)
 		statusResp.Body.Close()
@@ -413,30 +436,20 @@ func TestVideoHandlers_Live_Upload_Failure(t *testing.T) {
 	}
 	defer db.Close()
 
-	var userID string
-	err = db.QueryRow(ctx,
-		`INSERT INTO users (email, password_hash) VALUES ($1, $2)
-		 ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-		 RETURNING id`,
-		"handlers-upload-test@example.com", "test-hash",
-	).Scan(&userID)
-	if err != nil {
-		t.Fatalf("upsert test user: %v", err)
-	}
+	authService := services.NewAuthService(testJWTSecret)
+	userID := createTestUser(t, db, "handlers-upload-test@example.com")
+	token := testAuthToken(t, authService, userID, "handlers-upload-test@example.com")
 
 	s3Client, err := services.NewS3Client(ctx, s3Bucket)
 	if err != nil {
 		t.Fatalf("new s3 client: %v", err)
 	}
 
-	srv := newTestServer(t, db, supadataKey, openaiKey, s3Client)
+	srv := newTestServer(t, db, supadataKey, openaiKey, s3Client, authService)
 	defer srv.Close()
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	if err := writer.WriteField("user_id", userID); err != nil {
-		t.Fatalf("write user_id field: %v", err)
-	}
 	part, err := writer.CreateFormFile("file", "not-media.txt")
 	if err != nil {
 		t.Fatalf("create form file: %v", err)
@@ -448,10 +461,7 @@ func TestVideoHandlers_Live_Upload_Failure(t *testing.T) {
 		t.Fatalf("close multipart writer: %v", err)
 	}
 
-	resp, err := http.Post(srv.URL+"/api/videos/upload", writer.FormDataContentType(), &body)
-	if err != nil {
-		t.Fatalf("POST /api/videos/upload: %v", err)
-	}
+	resp := doRequest(t, "POST", srv.URL+"/api/videos/upload", token, &body, writer.FormDataContentType())
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("upload status = %d, want %d", resp.StatusCode, http.StatusAccepted)
@@ -466,10 +476,7 @@ func TestVideoHandlers_Live_Upload_Failure(t *testing.T) {
 	deadline := time.Now().Add(30 * time.Second)
 	var finalStatus models.VideoStatus
 	for time.Now().Before(deadline) {
-		statusResp, err := http.Get(srv.URL + "/api/videos/" + video.ID)
-		if err != nil {
-			t.Fatalf("GET /api/videos/{id}: %v", err)
-		}
+		statusResp := doRequest(t, "GET", srv.URL+"/api/videos/"+video.ID, token, nil, "")
 		var polled models.Video
 		decodeErr := json.NewDecoder(statusResp.Body).Decode(&polled)
 		statusResp.Body.Close()

@@ -3,13 +3,12 @@ import { getErrorMessage, submitYouTubeVideo, uploadVideo } from '../api'
 import type { Video } from '../types'
 
 interface SubmitFormProps {
-  userId: string
   onSubmitted: (video: Video) => void
 }
 
 type Mode = 'youtube' | 'upload'
 
-function SubmitForm({ userId, onSubmitted }: SubmitFormProps) {
+function SubmitForm({ onSubmitted }: SubmitFormProps) {
   const [mode, setMode] = useState<Mode>('youtube')
   const [videoUrl, setVideoUrl] = useState('')
   const [file, setFile] = useState<File | null>(null)
@@ -34,8 +33,8 @@ function SubmitForm({ userId, onSubmitted }: SubmitFormProps) {
     try {
       const video =
         mode === 'youtube'
-          ? await submitYouTubeVideo(videoUrl.trim(), lang, userId)
-          : await uploadVideo(file as File, lang, userId)
+          ? await submitYouTubeVideo(videoUrl.trim(), lang)
+          : await uploadVideo(file as File, lang)
       onSubmitted(video)
     } catch (err) {
       setError(getErrorMessage(err, 'Something went wrong submitting the video. Please try again.'))

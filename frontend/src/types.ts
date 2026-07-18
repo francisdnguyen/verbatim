@@ -24,3 +24,14 @@ export interface AskResponse {
   answer: string
   sources: Source[]
 }
+
+export interface User {
+  id: string
+  email: string
+  created_at: string
+}
+
+export interface AuthResponse {
+  token: string
+  user: User
+}

@@ -1,35 +1,50 @@
-import { useEffect, useState } from 'react'
-import { getOrCreateDemoUser } from './api'
+import { useState } from 'react'
+import { TOKEN_STORAGE_KEY } from './api'
+import AuthForm from './components/AuthForm'
 import SubmitForm from './components/SubmitForm'
 import VideoPanel from './components/VideoPanel'
-import type { Video } from './types'
+import type { User, Video } from './types'
 import './App.css'
 
-const USER_ID_STORAGE_KEY = 'verbatim_user_id'
-
 function App() {
-  const [userId, setUserId] = useState<string | null>(() => localStorage.getItem(USER_ID_STORAGE_KEY))
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem(TOKEN_STORAGE_KEY))
+  const [user, setUser] = useState<User | null>(null)
   const [video, setVideo] = useState<Video | null>(null)
 
-  useEffect(() => {
-    if (userId) {
-      return
-    }
-    getOrCreateDemoUser().then((user) => {
-      localStorage.setItem(USER_ID_STORAGE_KEY, user.id)
-      setUserId(user.id)
-    })
-  }, [userId])
+  function handleLogout() {
+    localStorage.removeItem(TOKEN_STORAGE_KEY)
+    setToken(null)
+    setUser(null)
+    setVideo(null)
+  }
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
-      <h1 className="text-3xl font-semibold mb-8">Verbatim</h1>
+      <div className="flex items-center justify-between w-full max-w-2xl mb-8">
+        <h1 className="text-3xl font-semibold">Verbatim</h1>
+        {token && (
+          <div className="flex items-center gap-3">
+            {user && <span className="text-sm text-[var(--text)]">{user.email}</span>}
+            <button type="button" onClick={handleLogout} className="text-sm underline">
+              Log out
+            </button>
+          </div>
+        )}
+      </div>
 
-      {!userId && <p>Setting things up...</p>}
+      {!token && (
+        <AuthForm
+          onAuthenticated={(auth) => {
+            localStorage.setItem(TOKEN_STORAGE_KEY, auth.token)
+            setToken(auth.token)
+            setUser(auth.user)
+          }}
+        />
+      )}
 
-      {userId && !video && <SubmitForm userId={userId} onSubmitted={setVideo} />}
+      {token && !video && <SubmitForm onSubmitted={setVideo} />}
 
-      {userId && video && (
+      {token && video && (
         <VideoPanel video={video} onVideoUpdate={setVideo} onReset={() => setVideo(null)} />
       )}
     </div>
