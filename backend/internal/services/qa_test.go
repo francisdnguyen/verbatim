@@ -43,15 +43,15 @@ func TestAnswerQuestion_Live(t *testing.T) {
 	}
 
 	transcriptClient := NewClient(supadataKey)
-	embedClient := NewEmbeddingClient(openaiKey)
+	openAIClient := NewOpenAIClient(openaiKey)
 
-	video, err := IngestYouTubeVideo(ctx, db, transcriptClient, embedClient, userID, liveTestVideo, "en")
+	video, err := IngestYouTubeVideo(ctx, db, transcriptClient, openAIClient, userID, liveTestVideo, "en")
 	if err != nil {
 		t.Fatalf("IngestYouTubeVideo: %v", err)
 	}
 	defer db.Exec(context.Background(), `DELETE FROM videos WHERE id = $1`, video.ID)
 
-	answer, err := AnswerQuestion(ctx, db, embedClient, video.ID, "What is this video about?")
+	answer, err := AnswerQuestion(ctx, db, openAIClient, video.ID, "What is this video about?")
 	if err != nil {
 		t.Fatalf("AnswerQuestion: %v", err)
 	}
@@ -109,9 +109,9 @@ func TestAnswerQuestion_Live_NotReady(t *testing.T) {
 	}
 	defer db.Exec(context.Background(), `DELETE FROM videos WHERE id = $1`, video.ID)
 
-	embedClient := NewEmbeddingClient(openaiKey)
+	openAIClient := NewOpenAIClient(openaiKey)
 
-	_, err = AnswerQuestion(ctx, db, embedClient, video.ID, "What is this video about?")
+	_, err = AnswerQuestion(ctx, db, openAIClient, video.ID, "What is this video about?")
 	if err == nil {
 		t.Fatal("expected an error for a not-yet-ready video, got nil")
 	}

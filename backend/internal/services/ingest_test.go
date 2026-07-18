@@ -46,10 +46,10 @@ func TestIngestYouTubeVideo_Live(t *testing.T) {
 	}
 
 	transcriptClient := NewClient(supadataKey)
-	embedClient := NewEmbeddingClient(openaiKey)
+	openAIClient := NewOpenAIClient(openaiKey)
 
 	// liveTestVideo is the same fixture URL used by the Supadata/embed live tests.
-	video, err := IngestYouTubeVideo(ctx, db, transcriptClient, embedClient, userID, liveTestVideo, "en")
+	video, err := IngestYouTubeVideo(ctx, db, transcriptClient, openAIClient, userID, liveTestVideo, "en")
 	if err != nil {
 		t.Fatalf("IngestYouTubeVideo: %v", err)
 	}
@@ -119,12 +119,12 @@ func TestIngestYouTubeVideo_Live_FailurePathMarksVideoFailed(t *testing.T) {
 	}
 
 	transcriptClient := NewClient(supadataKey)
-	embedClient := NewEmbeddingClient(openaiKey)
+	openAIClient := NewOpenAIClient(openaiKey)
 
 	// A syntactically valid but nonexistent YouTube video ID: CreateVideo
 	// succeeds (so the failure-marking defer is registered), but
 	// FetchTranscript fails, exercising the failure path end to end.
-	video, err := IngestYouTubeVideo(ctx, db, transcriptClient, embedClient, userID, "https://www.youtube.com/watch?v=0000000000X", "en")
+	video, err := IngestYouTubeVideo(ctx, db, transcriptClient, openAIClient, userID, "https://www.youtube.com/watch?v=0000000000X", "en")
 	if video.ID != "" {
 		defer db.Exec(context.Background(), `DELETE FROM videos WHERE id = $1`, video.ID)
 	}

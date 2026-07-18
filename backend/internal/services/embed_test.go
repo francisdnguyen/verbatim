@@ -52,7 +52,7 @@ func TestEmbedChunks_ParsesAndConverts(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewEmbeddingClient("test-key", option.WithBaseURL(srv.URL))
+	client := NewOpenAIClient("test-key", option.WithBaseURL(srv.URL))
 	results, err := client.EmbedChunks(context.Background(), chunks)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -86,7 +86,7 @@ func TestEmbedChunks_EmptyInput(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewEmbeddingClient("test-key", option.WithBaseURL(srv.URL))
+	client := NewOpenAIClient("test-key", option.WithBaseURL(srv.URL))
 	results, err := client.EmbedChunks(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -121,7 +121,7 @@ func TestEmbedChunks_HandlesOutOfOrderResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewEmbeddingClient("test-key", option.WithBaseURL(srv.URL))
+	client := NewOpenAIClient("test-key", option.WithBaseURL(srv.URL))
 	results, err := client.EmbedChunks(context.Background(), chunks)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -161,7 +161,7 @@ func TestEmbedChunks_RejectsDuplicateIndex(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := NewEmbeddingClient("test-key", option.WithBaseURL(srv.URL))
+	client := NewOpenAIClient("test-key", option.WithBaseURL(srv.URL))
 	_, err := client.EmbedChunks(context.Background(), chunks)
 	if err == nil {
 		t.Fatal("expected an error for a duplicate response index, got nil")
@@ -183,7 +183,7 @@ func TestEmbedChunks_Live(t *testing.T) {
 		{Text: "a recipe for chocolate cake", ChunkIndex: 1},
 	}
 
-	client := NewEmbeddingClient(apiKey)
+	client := NewOpenAIClient(apiKey)
 	results, err := client.EmbedChunks(context.Background(), chunks)
 	if err != nil {
 		t.Fatalf("live embed failed: %v", err)

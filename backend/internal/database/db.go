@@ -87,6 +87,30 @@ func (db *DB) CreateVideo(ctx context.Context, userID, sourceURL string) (models
 	return v, nil
 }
 
+// CreateUploadedVideo inserts a new upload-sourced video row (status starts
+// 'pending'). title is optional; an empty string is stored as NULL.
+func (db *DB) CreateUploadedVideo(ctx context.Context, userID, s3Key, title string) (models.Video, error) {
+	var titleArg *string
+	if title != "" {
+		titleArg = &title
+	}
+
+	var v models.Video
+	err := db.QueryRow(ctx,
+		`INSERT INTO videos (user_id, source_type, s3_key, title)
+		 VALUES ($1, 'upload', $2, $3)
+		 RETURNING id, user_id, source_type, source_url, s3_key, title, status, created_at, updated_at`,
+		userID, s3Key, titleArg,
+	).Scan(&v.ID, &v.UserID, &v.SourceType, &v.SourceURL, &v.S3Key, &v.Title, &v.Status, &v.CreatedAt, &v.UpdatedAt)
+	if pgErrorCode(err) == "23503" { // foreign_key_violation: user_id doesn't exist
+		return models.Video{}, ErrUserNotFound
+	}
+	if err != nil {
+		return models.Video{}, fmt.Errorf("create uploaded video: %w", err)
+	}
+	return v, nil
+}
+
 // GetVideo looks up a single video row by ID, returning ErrVideoNotFound if
 // no such row exists.
 func (db *DB) GetVideo(ctx context.Context, videoID string) (models.Video, error) {

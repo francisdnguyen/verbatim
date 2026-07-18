@@ -44,7 +44,7 @@ const topK = 5
 func AnswerQuestion(
 	ctx context.Context,
 	db *database.DB,
-	embedClient *EmbeddingClient,
+	openAIClient *OpenAIClient,
 	videoID, question string,
 ) (Answer, error) {
 	video, err := db.GetVideo(ctx, videoID)
@@ -55,7 +55,7 @@ func AnswerQuestion(
 		return Answer{}, ErrVideoNotReady
 	}
 
-	queryEmbedding, err := embedClient.EmbedQuery(ctx, question)
+	queryEmbedding, err := openAIClient.EmbedQuery(ctx, question)
 	if err != nil {
 		return Answer{}, fmt.Errorf("answer question: %w", err)
 	}
@@ -84,7 +84,7 @@ func AnswerQuestion(
 		"Only say the video doesn't address this if none of the excerpts are meaningfully related to the question."
 	userPrompt := fmt.Sprintf("Transcript excerpts:\n\n%s\nQuestion: %s", excerpts.String(), question)
 
-	answerText, err := embedClient.Ask(ctx, systemPrompt, userPrompt)
+	answerText, err := openAIClient.Ask(ctx, systemPrompt, userPrompt)
 	if err != nil {
 		return Answer{}, fmt.Errorf("answer question: %w", err)
 	}
