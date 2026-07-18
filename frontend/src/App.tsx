@@ -3,6 +3,7 @@ import { TOKEN_STORAGE_KEY } from './api'
 import AuthForm from './components/AuthForm'
 import Landing from './components/Landing'
 import SubmitForm from './components/SubmitForm'
+import ThemeToggle from './components/ThemeToggle'
 import VideoPanel from './components/VideoPanel'
 import type { User, Video } from './types'
 import './App.css'
@@ -25,6 +26,8 @@ function App() {
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
+      <ThemeToggle />
+
       {token && (
         <div className="flex items-center justify-between w-full max-w-2xl mb-8">
           <h1 className="text-3xl font-semibold">Verbatim</h1>
