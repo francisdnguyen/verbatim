@@ -14,6 +14,7 @@ function AuthForm({ onAuthenticated, initialMode = 'login', onBack }: AuthFormPr
   const [mode, setMode] = useState<Mode>(initialMode)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -23,6 +24,10 @@ function AuthForm({ onAuthenticated, initialMode = 'login', onBack }: AuthFormPr
 
     if (email.trim() === '' || password === '') {
       setError('Enter an email and password.')
+      return
+    }
+    if (mode === 'register' && password !== confirmPassword) {
+      setError('Passwords do not match.')
       return
     }
 
@@ -38,56 +43,91 @@ function AuthForm({ onAuthenticated, initialMode = 'login', onBack }: AuthFormPr
   }
 
   return (
-    <div className="mx-auto max-w-md w-full">
-      {onBack && (
-        <button type="button" onClick={onBack} className="text-sm mb-4 underline">
-          ← Back
-        </button>
-      )}
-
-      <div className="flex gap-2 mb-4">
-        <button
-          type="button"
-          onClick={() => setMode('login')}
-          className={`px-4 py-2 rounded ${mode === 'login' ? 'bg-[var(--accent)] text-white' : 'bg-[var(--code-bg)]'}`}
-        >
-          Log in
-        </button>
-        <button
-          type="button"
-          onClick={() => setMode('register')}
-          className={`px-4 py-2 rounded ${mode === 'register' ? 'bg-[var(--accent)] text-white' : 'bg-[var(--code-bg)]'}`}
-        >
-          Register
-        </button>
+    <div className="mx-auto max-w-md w-full border border-[var(--border)] rounded-xl p-8">
+      <div className="text-center mb-6">
+        <div className="text-4xl mb-2">🎙️</div>
+        <h2 className="text-2xl font-bold text-[var(--text-h)]">
+          {mode === 'login' ? 'Welcome to Verbatim' : 'Join Verbatim'}
+        </h2>
+        <p className="text-sm text-[var(--text)] mt-1">
+          {mode === 'login' ? 'Sign in to your account' : 'Sign up to get started'}
+        </p>
       </div>
 
-      <form onSubmit={handleSubmit} className="flex flex-col gap-3">
-        <input
-          type="email"
-          placeholder="Email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          className="border border-[var(--border)] rounded px-3 py-2"
-        />
-        <input
-          type="password"
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="border border-[var(--border)] rounded px-3 py-2"
-        />
+      <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+        <div className="flex flex-col gap-1">
+          <label className="text-sm font-medium text-[var(--text-h)]">Email</label>
+          <input
+            type="email"
+            placeholder="your@email.com"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            className="border border-[var(--border)] rounded px-3 py-2"
+          />
+        </div>
+
+        <div className="flex flex-col gap-1">
+          <label className="text-sm font-medium text-[var(--text-h)]">Password</label>
+          <input
+            type="password"
+            placeholder={mode === 'register' ? 'At least 8 characters' : 'Enter your password'}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className="border border-[var(--border)] rounded px-3 py-2"
+          />
+        </div>
+
+        {mode === 'register' && (
+          <div className="flex flex-col gap-1">
+            <label className="text-sm font-medium text-[var(--text-h)]">Confirm password</label>
+            <input
+              type="password"
+              placeholder="Re-enter your password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              className="border border-[var(--border)] rounded px-3 py-2"
+            />
+          </div>
+        )}
 
         {error && <p className="text-red-500 text-sm">{error}</p>}
 
         <button
           type="submit"
           disabled={submitting}
-          className="bg-[var(--accent)] text-white rounded px-4 py-2 disabled:opacity-50"
+          className="w-full bg-[var(--accent)] text-white rounded px-4 py-2 font-semibold disabled:opacity-50"
         >
-          {submitting ? (mode === 'login' ? 'Logging in...' : 'Registering...') : mode === 'login' ? 'Log in' : 'Register'}
+          {submitting
+            ? mode === 'login' ? 'Signing in...' : 'Creating account...'
+            : mode === 'login' ? 'Sign In' : 'Create Account'}
         </button>
       </form>
+
+      <p className="text-center text-sm mt-4">
+        {mode === 'login' ? (
+          <>
+            Don't have an account?{' '}
+            <button type="button" onClick={() => setMode('register')} className="text-[var(--accent)] underline">
+              Create one
+            </button>
+          </>
+        ) : (
+          <>
+            Already have an account?{' '}
+            <button type="button" onClick={() => setMode('login')} className="text-[var(--accent)] underline">
+              Sign in
+            </button>
+          </>
+        )}
+      </p>
+
+      {onBack && (
+        <div className="border-t border-[var(--border)] mt-6 pt-4 text-center">
+          <button type="button" onClick={onBack} className="text-sm underline">
+            ← Back to Home
+          </button>
+        </div>
+      )}
     </div>
   )
 }
