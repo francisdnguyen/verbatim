@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { TOKEN_STORAGE_KEY } from './api'
+import { useEffect, useState } from 'react'
+import { getCurrentUser, logout } from './api'
 import AuthForm from './components/AuthForm'
 import Landing from './components/Landing'
 import SubmitForm from './components/SubmitForm'
@@ -11,28 +11,40 @@ import './App.css'
 type LoggedOutView = 'landing' | 'login' | 'register'
 
 function App() {
-  const [token, setToken] = useState<string | null>(() => localStorage.getItem(TOKEN_STORAGE_KEY))
   const [user, setUser] = useState<User | null>(null)
+  // The session lives in an httpOnly cookie now, invisible to JS, so on
+  // load we have to ask the backend who (if anyone) it belongs to rather
+  // than reading a token out of localStorage synchronously.
+  const [checkingSession, setCheckingSession] = useState(true)
   const [video, setVideo] = useState<Video | null>(null)
   const [view, setView] = useState<LoggedOutView>('landing')
 
-  function handleLogout() {
-    localStorage.removeItem(TOKEN_STORAGE_KEY)
-    setToken(null)
+  useEffect(() => {
+    getCurrentUser()
+      .then(setUser)
+      .finally(() => setCheckingSession(false))
+  }, [])
+
+  async function handleLogout() {
+    await logout()
     setUser(null)
     setVideo(null)
     setView('landing')
+  }
+
+  if (checkingSession) {
+    return null
   }
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
       <ThemeToggle />
 
-      {token && (
+      {user && (
         <div className="flex items-center justify-between w-full max-w-2xl mb-8">
           <h1 className="text-3xl font-semibold">Verbatim</h1>
           <div className="flex items-center gap-3">
-            {user && <span className="text-sm text-[var(--text)]">{user.email}</span>}
+            <span className="text-sm text-[var(--text)]">{user.email}</span>
             <button type="button" onClick={handleLogout} className="text-sm underline">
               Log out
             </button>
@@ -40,23 +52,19 @@ function App() {
         </div>
       )}
 
-      {!token && view === 'landing' && <Landing onNavigate={setView} />}
+      {!user && view === 'landing' && <Landing onNavigate={setView} />}
 
-      {!token && view !== 'landing' && (
+      {!user && view !== 'landing' && (
         <AuthForm
           initialMode={view}
           onBack={() => setView('landing')}
-          onAuthenticated={(auth) => {
-            localStorage.setItem(TOKEN_STORAGE_KEY, auth.token)
-            setToken(auth.token)
-            setUser(auth.user)
-          }}
+          onAuthenticated={(auth) => setUser(auth.user)}
         />
       )}
 
-      {token && !video && <SubmitForm onSubmitted={setVideo} />}
+      {user && !video && <SubmitForm onSubmitted={setVideo} />}
 
-      {token && video && (
+      {user && video && (
         <VideoPanel video={video} onVideoUpdate={setVideo} onReset={() => setVideo(null)} />
       )}
     </div>

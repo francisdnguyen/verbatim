@@ -112,6 +112,27 @@ func (db *DB) GetUserByEmail(ctx context.Context, email string) (models.User, er
 	return u, nil
 }
 
+// GetUserByID looks up a user by ID, returning ErrUserNotFound if no such
+// row exists — used by the /api/auth/me session-bootstrap endpoint, whose
+// only input is the ID already verified inside the caller's JWT.
+func (db *DB) GetUserByID(ctx context.Context, userID string) (models.User, error) {
+	var u models.User
+	err := db.QueryRow(ctx,
+		`SELECT id, email, created_at FROM users WHERE id = $1`,
+		userID,
+	).Scan(&u.ID, &u.Email, &u.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return models.User{}, ErrUserNotFound
+	}
+	if pgErrorCode(err) == "22P02" { // invalid_text_representation: userID isn't a valid UUID
+		return models.User{}, ErrInvalidID
+	}
+	if err != nil {
+		return models.User{}, fmt.Errorf("get user by id: %w", err)
+	}
+	return u, nil
+}
+
 // CreateVideo inserts a new YouTube-sourced video row (status starts 'pending').
 func (db *DB) CreateVideo(ctx context.Context, userID, sourceURL string) (models.Video, error) {
 	var v models.Video

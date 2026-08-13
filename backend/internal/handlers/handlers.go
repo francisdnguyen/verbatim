@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +26,12 @@ const processTimeout = 10 * time.Minute
 // maxUploadSize caps a single direct file upload, rejected beyond this with
 // 413 rather than accepting an unbounded request body.
 const maxUploadSize = 1 << 30 // 1 GiB
+
+// maxJSONBodySize caps every plain-JSON request body — none of these
+// payloads (a URL, a question, an email/password pair) legitimately need
+// more than a few hundred bytes; this just stops an unbounded body from
+// being buffered in memory before json.Decode ever gets to reject it.
+const maxJSONBodySize = 1 << 20 // 1 MiB
 
 // VideoHandler serves the video ingestion and Q&A HTTP endpoints, wrapping
 // the DB and the external service clients the async pipeline and Q&A need.
@@ -50,6 +58,7 @@ type submitRequest struct {
 // runs the transcript → chunk → embed → store pipeline in the background —
 // the frontend polls HandleStatus until the row reaches ready/failed.
 func (h *VideoHandler) HandleSubmit(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodySize)
 	var req submitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -234,6 +243,7 @@ type askResponse struct {
 func (h *VideoHandler) HandleAsk(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodySize)
 	var req askRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -301,12 +311,13 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
-// authResponse is the JSON body returned by HandleRegister/HandleLogin.
+// userResponse is the JSON body returned by HandleRegister/HandleLogin/
+// HandleMe. The JWT itself is never included here — it only ever travels as
+// an httpOnly cookie, never somewhere client-side JS could read it.
 // models.User.PasswordHash already carries json:"-", so it's never
-// serialized here — nothing to scrub manually.
-type authResponse struct {
-	Token string      `json:"token"`
-	User  models.User `json:"user"`
+// serialized here either.
+type userResponse struct {
+	User models.User `json:"user"`
 }
 
 // minPasswordLength is the minimum acceptable length for a new password —
@@ -321,11 +332,76 @@ func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
-// HandleRegister creates a new user and returns a token for it — a
+// generateCSRFToken returns a random hex string for the double-submit CSRF
+// cookie — nothing here needs to be verifiable/signed like the JWT, just
+// unguessable, since its only job is proving the request-issuing JS could
+// read the cookie (i.e. is running on the real frontend origin).
+func generateCSRFToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate csrf token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// setAuthCookies sets the httpOnly session cookie and the JS-readable CSRF
+// cookie together, sized to expire alongside the JWT itself (services.TokenTTL).
+// secure/sameSite follow the secureCookies flag main.go derives from
+// COOKIE_SECURE: production (cross-site, HTTPS both ends) needs
+// SameSite=None+Secure for the browser to send the cookie at all; local dev
+// (plain HTTP) can't set Secure, and SameSite=None without Secure is
+// rejected by browsers outright, so it falls back to SameSite=Lax instead.
+func setAuthCookies(w http.ResponseWriter, token, csrfToken string, secureCookies bool) {
+	sameSite := http.SameSiteLaxMode
+	if secureCookies {
+		sameSite = http.SameSiteNoneMode
+	}
+	maxAge := int(services.TokenTTL.Seconds())
+	http.SetCookie(w, &http.Cookie{
+		Name:     middleware.TokenCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   maxAge,
+		HttpOnly: true,
+		Secure:   secureCookies,
+		SameSite: sameSite,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     middleware.CSRFCookieName,
+		Value:    csrfToken,
+		Path:     "/",
+		MaxAge:   maxAge,
+		HttpOnly: false, // the frontend must read this to echo it in X-CSRF-Token
+		Secure:   secureCookies,
+		SameSite: sameSite,
+	})
+}
+
+// clearAuthCookies expires both auth cookies immediately, for logout.
+func clearAuthCookies(w http.ResponseWriter, secureCookies bool) {
+	sameSite := http.SameSiteLaxMode
+	if secureCookies {
+		sameSite = http.SameSiteNoneMode
+	}
+	for _, name := range []string{middleware.TokenCookieName, middleware.CSRFCookieName} {
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: name == middleware.TokenCookieName,
+			Secure:   secureCookies,
+			SameSite: sameSite,
+		})
+	}
+}
+
+// HandleRegister creates a new user and starts a session for it — a
 // standalone function (not a VideoHandler method) since it only needs the
 // DB and auth service, not the video-specific clients.
-func HandleRegister(db *database.DB, authService *services.AuthService) http.HandlerFunc {
+func HandleRegister(db *database.DB, authService *services.AuthService, secureCookies bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodySize)
 		var req registerRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid request body")
@@ -365,15 +441,23 @@ func HandleRegister(db *database.DB, authService *services.AuthService) http.Han
 			writeError(w, http.StatusInternalServerError, "failed to register")
 			return
 		}
+		csrfToken, err := generateCSRFToken()
+		if err != nil {
+			log.Printf("register: generate csrf token: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to register")
+			return
+		}
 
-		writeJSON(w, http.StatusCreated, authResponse{Token: token, User: user})
+		setAuthCookies(w, token, csrfToken, secureCookies)
+		writeJSON(w, http.StatusCreated, userResponse{User: user})
 	}
 }
 
-// HandleLogin authenticates a user and returns a token for it — a
+// HandleLogin authenticates a user and starts a session for it — a
 // standalone function for the same reason as HandleRegister.
-func HandleLogin(db *database.DB, authService *services.AuthService) http.HandlerFunc {
+func HandleLogin(db *database.DB, authService *services.AuthService, secureCookies bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodySize)
 		var req loginRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid request body")
@@ -408,20 +492,66 @@ func HandleLogin(db *database.DB, authService *services.AuthService) http.Handle
 			writeError(w, http.StatusInternalServerError, "failed to log in")
 			return
 		}
+		csrfToken, err := generateCSRFToken()
+		if err != nil {
+			log.Printf("login: generate csrf token: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to log in")
+			return
+		}
 
-		writeJSON(w, http.StatusOK, authResponse{Token: token, User: user})
+		setAuthCookies(w, token, csrfToken, secureCookies)
+		writeJSON(w, http.StatusOK, userResponse{User: user})
+	}
+}
+
+// HandleLogout clears the session/CSRF cookies. Not CSRF-protected itself —
+// worst case a forged cross-site logout just deauthenticates the caller,
+// which isn't the kind of state change CSRF protection exists to prevent.
+func HandleLogout(secureCookies bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		clearAuthCookies(w, secureCookies)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// HandleMe returns the currently authenticated caller's user record — the
+// session-bootstrap endpoint the frontend calls on load to find out who (if
+// anyone) is logged in, now that the token itself lives in an httpOnly
+// cookie the frontend's JS can't read directly.
+func HandleMe(db *database.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, _ := middleware.GetUserID(r)
+		user, err := db.GetUserByID(r.Context(), userID)
+		if errors.Is(err, database.ErrUserNotFound) {
+			// A validly-signed session cookie for a user deleted after the
+			// token was issued — same 401 as "no session at all" so the
+			// frontend's getCurrentUser() treats it as logged-out instead of
+			// throwing, rather than a 500 it doesn't know how to handle.
+			writeError(w, http.StatusUnauthorized, "session no longer valid")
+			return
+		}
+		if err != nil {
+			log.Printf("me: get user %s: %v", userID, err)
+			writeError(w, http.StatusInternalServerError, "failed to load user")
+			return
+		}
+		writeJSON(w, http.StatusOK, userResponse{User: user})
 	}
 }
 
 // CorsMiddleware allows cross-origin requests from allowedOrigin (the
 // frontend dev server or, in production, the deployed Vercel origin) and
 // answers the browser's preflight OPTIONS request directly, since the mux
-// has no route registered for it otherwise.
+// has no route registered for it otherwise. Allow-Credentials is required
+// for the browser to actually send/receive the auth cookies cross-origin;
+// browsers refuse Allow-Credentials paired with a wildcard origin, which is
+// exactly why allowedOrigin must stay a specific value, never "*".
 func CorsMiddleware(allowedOrigin string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-CSRF-Token")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

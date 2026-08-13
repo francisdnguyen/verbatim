@@ -78,9 +78,17 @@ func testAuthToken(t *testing.T, authService *services.AuthService, userID, emai
 	return token
 }
 
-// doRequest sends method/url with an Authorization: Bearer token header —
-// a helper because http.Post/http.Get don't support custom headers, and
-// every call in this file now needs one.
+// testCSRFToken is an arbitrary fixed value used as both the CSRF cookie
+// and the X-CSRF-Token header in every test request — these tests bypass
+// HandleLogin (see testAuthToken), so there's no real login flow that paired
+// the two together; the middleware only checks that they match each other,
+// not that either came from a real session.
+const testCSRFToken = "test-csrf-token"
+
+// doRequest sends method/url with the session/CSRF cookies AuthMiddleware
+// now expects (it stopped reading the Authorization header once auth moved
+// to httpOnly cookies) — a helper because http.Post/http.Get don't support
+// custom headers/cookies, and every call in this file now needs both.
 func doRequest(t *testing.T, method, url, token string, body io.Reader, contentType string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(method, url, body)
@@ -90,7 +98,9 @@ func doRequest(t *testing.T, method, url, token string, body io.Reader, contentT
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.AddCookie(&http.Cookie{Name: middleware.TokenCookieName, Value: token})
+	req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: testCSRFToken})
+	req.Header.Set("X-CSRF-Token", testCSRFToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, url, err)
@@ -203,7 +213,7 @@ func TestVideoHandlers_Live(t *testing.T) {
 		t.Errorf("missing-fields status = %d, want %d", badResp.StatusCode, http.StatusBadRequest)
 	}
 
-	// 401 with no Authorization header at all.
+	// 401 with no session cookie at all.
 	noAuthReq, _ := http.NewRequest("GET", srv.URL+"/api/videos/"+video.ID, nil)
 	noAuthResp, err := http.DefaultClient.Do(noAuthReq)
 	if err != nil {
@@ -212,6 +222,23 @@ func TestVideoHandlers_Live(t *testing.T) {
 	noAuthResp.Body.Close()
 	if noAuthResp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("no-auth status = %d, want %d", noAuthResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// 403 for a state-changing request with a valid session cookie but a
+	// missing/mismatched CSRF token — confirms the double-submit check
+	// actually blocks a request that only has the (automatically-attached)
+	// session cookie, the exact shape of a forged cross-site request.
+	csrfReq, _ := http.NewRequest("POST", srv.URL+"/api/videos", bytes.NewReader(body))
+	csrfReq.Header.Set("Content-Type", "application/json")
+	csrfReq.AddCookie(&http.Cookie{Name: middleware.TokenCookieName, Value: token})
+	// Deliberately no CSRF cookie/header at all.
+	csrfResp, err := http.DefaultClient.Do(csrfReq)
+	if err != nil {
+		t.Fatalf("POST without csrf token: %v", err)
+	}
+	csrfResp.Body.Close()
+	if csrfResp.StatusCode != http.StatusForbidden {
+		t.Errorf("missing-csrf status = %d, want %d", csrfResp.StatusCode, http.StatusForbidden)
 	}
 
 	// Ask a real question about the now-ready video: 200 with a real answer and sources.

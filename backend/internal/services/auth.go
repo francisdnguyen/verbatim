@@ -13,9 +13,10 @@ import (
 // verification, uses an unexpected signing algorithm, or has expired.
 var ErrInvalidToken = errors.New("invalid or expired token")
 
-// tokenTTL is how long an issued token remains valid. No refresh mechanism
+// TokenTTL is how long an issued token remains valid. No refresh mechanism
 // exists yet, so this is a hard re-login boundary, not a renewable session.
-const tokenTTL = 24 * time.Hour
+// Exported so handlers.go can size the auth cookie's Max-Age to match.
+const TokenTTL = 24 * time.Hour
 
 // authClaims is the JWT payload: the caller's user ID and email alongside
 // the standard registered claims (expiry).
@@ -53,13 +54,13 @@ func (s *AuthService) CheckPassword(hash, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
-// GenerateToken issues a signed JWT for userID/email, valid for tokenTTL.
+// GenerateToken issues a signed JWT for userID/email, valid for TokenTTL.
 func (s *AuthService) GenerateToken(userID, email string) (string, error) {
 	claims := authClaims{
 		UserID: userID,
 		Email:  email,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(tokenTTL)),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(TokenTTL)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	}

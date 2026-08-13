@@ -1,16 +1,31 @@
 import axios from 'axios'
-import type { AskResponse, AuthResponse, Video } from './types'
+import type { AskResponse, AuthResponse, User, Video } from './types'
 
-export const TOKEN_STORAGE_KEY = 'verbatim_token'
+// Must match the backend's middleware.CSRFCookieName exactly.
+const CSRF_COOKIE_NAME = 'verbatim_csrf'
 
 const client = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080',
+  // The session lives entirely in an httpOnly cookie now (never in JS-visible
+  // storage), so every request needs the browser to actually attach it.
+  withCredentials: true,
 })
 
+// getCookie reads a plain (non-httpOnly) cookie by name — used only for the
+// CSRF cookie, which is deliberately readable by JS so it can be echoed back
+// in a header (the double-submit pattern the backend's AuthMiddleware checks).
+function getCookie(name: string): string | null {
+  const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'))
+  return match ? decodeURIComponent(match[1]) : null
+}
+
 client.interceptors.request.use((config) => {
-  const token = localStorage.getItem(TOKEN_STORAGE_KEY)
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`
+  const method = config.method?.toUpperCase()
+  if (method && method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+    const csrfToken = getCookie(CSRF_COOKIE_NAME)
+    if (csrfToken) {
+      config.headers['X-CSRF-Token'] = csrfToken
+    }
   }
   return config
 })
@@ -23,6 +38,27 @@ export async function register(email: string, password: string): Promise<AuthRes
 export async function login(email: string, password: string): Promise<AuthResponse> {
   const { data } = await client.post('/api/auth/login', { email, password })
   return data
+}
+
+export async function logout(): Promise<void> {
+  await client.post('/api/auth/logout')
+}
+
+// getCurrentUser asks the backend who (if anyone) the session cookie belongs
+// to — the session-bootstrap call on page load, now that the token itself
+// isn't readable from JS to check locally. Returns null on a 401 (no/expired
+// session) rather than throwing, since "not logged in" is an expected state,
+// not an error.
+export async function getCurrentUser(): Promise<User | null> {
+  try {
+    const { data } = await client.get<AuthResponse>('/api/auth/me')
+    return data.user
+  } catch (err) {
+    if (axios.isAxiosError(err) && err.response?.status === 401) {
+      return null
+    }
+    throw err
+  }
 }
 
 export async function submitYouTubeVideo(videoUrl: string, lang: string): Promise<Video> {

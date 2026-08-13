@@ -47,6 +47,13 @@ func main() {
 	if jwtSecret == "" {
 		log.Fatal("JWT_SECRET is not set")
 	}
+	// secureCookies controls the auth/CSRF cookies' Secure+SameSite
+	// attributes: production is cross-site (Vercel frontend, EC2 backend)
+	// over HTTPS, which needs SameSite=None+Secure for the browser to send
+	// the cookie at all. Local dev has no TLS, and browsers reject
+	// SameSite=None without Secure outright, so it must default to false —
+	// only set to true explicitly in .env.production.
+	secureCookies := os.Getenv("COOKIE_SECURE") == "true"
 
 	ctx := context.Background()
 
@@ -73,8 +80,10 @@ func main() {
 	mux.Handle("GET /api/videos/{id}", authMW(http.HandlerFunc(videoHandler.HandleStatus)))
 	mux.Handle("POST /api/videos/{id}/ask", authMW(http.HandlerFunc(videoHandler.HandleAsk)))
 	mux.Handle("POST /api/videos/upload", authMW(http.HandlerFunc(videoHandler.HandleUpload)))
-	mux.HandleFunc("POST /api/auth/register", handlers.HandleRegister(db, authService))
-	mux.HandleFunc("POST /api/auth/login", handlers.HandleLogin(db, authService))
+	mux.Handle("GET /api/auth/me", authMW(handlers.HandleMe(db)))
+	mux.HandleFunc("POST /api/auth/register", handlers.HandleRegister(db, authService, secureCookies))
+	mux.HandleFunc("POST /api/auth/login", handlers.HandleLogin(db, authService, secureCookies))
+	mux.HandleFunc("POST /api/auth/logout", handlers.HandleLogout(secureCookies))
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -106,7 +115,9 @@ func main() {
 	go func() {
 		log.Printf("Listening on :%s", port)
 		log.Println("  POST /api/auth/register    - create a new user account")
-		log.Println("  POST /api/auth/login       - log in and receive a token")
+		log.Println("  POST /api/auth/login       - log in and start a session")
+		log.Println("  POST /api/auth/logout      - end the current session")
+		log.Println("  GET  /api/auth/me          - get the current session's user (auth required)")
 		log.Println("  POST /api/videos           - submit a YouTube video for ingestion (auth required)")
 		log.Println("  POST /api/videos/upload    - upload a video/audio file for ingestion (auth required)")
 		log.Println("  GET  /api/videos/{id}      - poll a video's ingestion status (auth required)")
