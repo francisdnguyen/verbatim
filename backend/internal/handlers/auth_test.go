@@ -29,25 +29,19 @@ func newAuthTestServer(db *database.DB, authService *services.AuthService) *http
 	return httptest.NewServer(mux)
 }
 
-// authCookies extracts the session and CSRF cookies from a register/login
-// response, failing the test if either is missing.
-func authCookies(t *testing.T, resp *http.Response) (sessionCookie, csrfCookie *http.Cookie) {
+// sessionCookie extracts the session cookie from a register/login response,
+// failing the test if it's missing. The CSRF token isn't a cookie at all —
+// it comes back in the response body (userResponse.CSRFToken) instead, see
+// the comment on services.AuthService.ValidateToken for why.
+func sessionCookie(t *testing.T, resp *http.Response) *http.Cookie {
 	t.Helper()
 	for _, c := range resp.Cookies() {
-		switch c.Name {
-		case middleware.TokenCookieName:
-			sessionCookie = c
-		case middleware.CSRFCookieName:
-			csrfCookie = c
+		if c.Name == middleware.TokenCookieName {
+			return c
 		}
 	}
-	if sessionCookie == nil {
-		t.Fatal("expected a session cookie to be set")
-	}
-	if csrfCookie == nil {
-		t.Fatal("expected a CSRF cookie to be set")
-	}
-	return sessionCookie, csrfCookie
+	t.Fatal("expected a session cookie to be set")
+	return nil
 }
 
 // TestAuthHandlers_Live drives register/login over real HTTP against a real
@@ -91,15 +85,19 @@ func TestAuthHandlers_Live(t *testing.T) {
 	if registerAuth.User.Email != email {
 		t.Errorf("register user email = %q, want %q", registerAuth.User.Email, email)
 	}
-	sessionCookie, csrfCookie := authCookies(t, registerResp)
-	if !sessionCookie.HttpOnly {
+	if registerAuth.CSRFToken == "" {
+		t.Error("expected a non-empty CSRF token in the register response body")
+	}
+	regSession := sessionCookie(t, registerResp)
+	if !regSession.HttpOnly {
 		t.Error("expected the session cookie to be HttpOnly")
 	}
-	if csrfCookie.HttpOnly {
-		t.Error("expected the CSRF cookie to be readable by JS (not HttpOnly)")
-	}
-	if _, err := authService.ValidateToken(sessionCookie.Value); err != nil {
+	claims, err := authService.ValidateToken(regSession.Value)
+	if err != nil {
 		t.Errorf("expected register's session cookie to validate, got %v", err)
+	}
+	if claims.CSRFToken != registerAuth.CSRFToken {
+		t.Errorf("session cookie's embedded CSRF claim = %q, want it to match the response body's %q", claims.CSRFToken, registerAuth.CSRFToken)
 	}
 
 	// Registering the same email again is a 409, not a silent success.
@@ -126,8 +124,11 @@ func TestAuthHandlers_Live(t *testing.T) {
 	if err := json.NewDecoder(loginResp.Body).Decode(&loginAuth); err != nil {
 		t.Fatalf("decode login response: %v", err)
 	}
-	loginSessionCookie, _ := authCookies(t, loginResp)
-	if _, err := authService.ValidateToken(loginSessionCookie.Value); err != nil {
+	if loginAuth.CSRFToken == "" {
+		t.Error("expected a non-empty CSRF token in the login response body")
+	}
+	loginSession := sessionCookie(t, loginResp)
+	if _, err := authService.ValidateToken(loginSession.Value); err != nil {
 		t.Errorf("expected login's session cookie to validate, got %v", err)
 	}
 
@@ -165,9 +166,10 @@ func TestAuthHandlers_Live(t *testing.T) {
 	}
 
 	// /api/auth/me: the session cookie alone (no CSRF header needed — it's a
-	// GET) identifies the caller.
+	// GET) identifies the caller and hands back a fresh CSRF token for the
+	// frontend to re-learn on a page reload.
 	meReq, _ := http.NewRequest("GET", srv.URL+"/api/auth/me", nil)
-	meReq.AddCookie(sessionCookie)
+	meReq.AddCookie(regSession)
 	meResp, err := http.DefaultClient.Do(meReq)
 	if err != nil {
 		t.Fatalf("GET /api/auth/me: %v", err)
@@ -183,6 +185,9 @@ func TestAuthHandlers_Live(t *testing.T) {
 	if me.User.Email != email {
 		t.Errorf("me user email = %q, want %q", me.User.Email, email)
 	}
+	if me.CSRFToken != registerAuth.CSRFToken {
+		t.Errorf("me CSRFToken = %q, want it to match the original session's %q", me.CSRFToken, registerAuth.CSRFToken)
+	}
 
 	// /api/auth/me with no cookie at all: 401.
 	noCookieResp, err := http.Get(srv.URL + "/api/auth/me")
@@ -194,8 +199,8 @@ func TestAuthHandlers_Live(t *testing.T) {
 		t.Errorf("me without cookie status = %d, want %d", noCookieResp.StatusCode, http.StatusUnauthorized)
 	}
 
-	// /api/auth/logout clears both cookies (Max-Age < 0 tells the browser to
-	// delete them immediately).
+	// /api/auth/logout clears the session cookie (Max-Age < 0 tells the
+	// browser to delete it immediately).
 	logoutResp, err := http.Post(srv.URL+"/api/auth/logout", "", nil)
 	if err != nil {
 		t.Fatalf("POST /api/auth/logout: %v", err)
@@ -204,14 +209,14 @@ func TestAuthHandlers_Live(t *testing.T) {
 	if logoutResp.StatusCode != http.StatusNoContent {
 		t.Errorf("logout status = %d, want %d", logoutResp.StatusCode, http.StatusNoContent)
 	}
-	clearedNames := map[string]bool{}
+	cleared := false
 	for _, c := range logoutResp.Cookies() {
-		if c.MaxAge < 0 {
-			clearedNames[c.Name] = true
+		if c.Name == middleware.TokenCookieName && c.MaxAge < 0 {
+			cleared = true
 		}
 	}
-	if !clearedNames[middleware.TokenCookieName] || !clearedNames[middleware.CSRFCookieName] {
-		t.Errorf("expected logout to clear both cookies, got Set-Cookie for: %v", clearedNames)
+	if !cleared {
+		t.Error("expected logout to clear the session cookie")
 	}
 }
 
@@ -245,7 +250,7 @@ func TestAuthHandlers_Live_MeWithDeletedUser(t *testing.T) {
 	// A syntactically valid UUID with no backing row — same shape a real
 	// token has, just for a user that (say) got deleted after the token was
 	// issued.
-	token, err := authService.GenerateToken("00000000-0000-0000-0000-000000000099", "ghost@example.com")
+	token, err := authService.GenerateToken("00000000-0000-0000-0000-000000000099", "ghost@example.com", "csrf-ghost")
 	if err != nil {
 		t.Fatalf("generate token: %v", err)
 	}

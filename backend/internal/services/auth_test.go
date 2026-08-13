@@ -24,17 +24,20 @@ func TestAuthService_HashAndCheckPassword(t *testing.T) {
 func TestAuthService_GenerateAndValidateToken(t *testing.T) {
 	s := NewAuthService("test-secret")
 
-	token, err := s.GenerateToken("user-123", "user@example.com")
+	token, err := s.GenerateToken("user-123", "user@example.com", "csrf-abc")
 	if err != nil {
 		t.Fatalf("GenerateToken: %v", err)
 	}
 
-	userID, err := s.ValidateToken(token)
+	claims, err := s.ValidateToken(token)
 	if err != nil {
 		t.Fatalf("ValidateToken: %v", err)
 	}
-	if userID != "user-123" {
-		t.Errorf("ValidateToken userID = %q, want %q", userID, "user-123")
+	if claims.UserID != "user-123" {
+		t.Errorf("ValidateToken userID = %q, want %q", claims.UserID, "user-123")
+	}
+	if claims.CSRFToken != "csrf-abc" {
+		t.Errorf("ValidateToken csrfToken = %q, want %q", claims.CSRFToken, "csrf-abc")
 	}
 }
 
@@ -50,7 +53,7 @@ func TestAuthService_ValidateToken_RejectsWrongSecret(t *testing.T) {
 	issuer := NewAuthService("secret-a")
 	verifier := NewAuthService("secret-b")
 
-	token, err := issuer.GenerateToken("user-123", "user@example.com")
+	token, err := issuer.GenerateToken("user-123", "user@example.com", "csrf-abc")
 	if err != nil {
 		t.Fatalf("GenerateToken: %v", err)
 	}

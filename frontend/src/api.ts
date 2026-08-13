@@ -1,9 +1,6 @@
 import axios from 'axios'
 import type { AskResponse, AuthResponse, User, Video } from './types'
 
-// Must match the backend's middleware.CSRFCookieName exactly.
-const CSRF_COOKIE_NAME = 'verbatim_csrf'
-
 const client = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080',
   // The session lives entirely in an httpOnly cookie now (never in JS-visible
@@ -11,50 +8,57 @@ const client = axios.create({
   withCredentials: true,
 })
 
-// getCookie reads a plain (non-httpOnly) cookie by name — used only for the
-// CSRF cookie, which is deliberately readable by JS so it can be echoed back
-// in a header (the double-submit pattern the backend's AuthMiddleware checks).
-function getCookie(name: string): string | null {
-  const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'))
-  return match ? decodeURIComponent(match[1]) : null
-}
+// The CSRF token lives only in memory, never a cookie or localStorage.
+// Why not a second cookie (the usual double-submit shape): the frontend
+// (Vercel) and backend (EC2) are on genuinely different domains in
+// production, and a cookie is only ever readable by script running on the
+// domain that set it — this page's JS can never read a cookie the backend
+// set, no matter its SameSite/Secure attributes. The backend instead signs
+// this same value into the session cookie's JWT and hands it back in the
+// JSON body of register/login/me, which this page's own fetch legitimately
+// reads. Lost on a full page reload by design — getCurrentUser() re-learns
+// it from a fresh /me call every time the app boots.
+let csrfToken: string | null = null
 
 client.interceptors.request.use((config) => {
   const method = config.method?.toUpperCase()
-  if (method && method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
-    const csrfToken = getCookie(CSRF_COOKIE_NAME)
-    if (csrfToken) {
-      config.headers['X-CSRF-Token'] = csrfToken
-    }
+  if (method && method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS' && csrfToken) {
+    config.headers['X-CSRF-Token'] = csrfToken
   }
   return config
 })
 
 export async function register(email: string, password: string): Promise<AuthResponse> {
-  const { data } = await client.post('/api/auth/register', { email, password })
+  const { data } = await client.post<AuthResponse>('/api/auth/register', { email, password })
+  csrfToken = data.csrf_token
   return data
 }
 
 export async function login(email: string, password: string): Promise<AuthResponse> {
-  const { data } = await client.post('/api/auth/login', { email, password })
+  const { data } = await client.post<AuthResponse>('/api/auth/login', { email, password })
+  csrfToken = data.csrf_token
   return data
 }
 
 export async function logout(): Promise<void> {
   await client.post('/api/auth/logout')
+  csrfToken = null
 }
 
 // getCurrentUser asks the backend who (if anyone) the session cookie belongs
 // to — the session-bootstrap call on page load, now that the token itself
-// isn't readable from JS to check locally. Returns null on a 401 (no/expired
-// session) rather than throwing, since "not logged in" is an expected state,
-// not an error.
+// isn't readable from JS to check locally. Also re-establishes the in-memory
+// CSRF token, which a fresh page load never has. Returns null on a 401
+// (no/expired session) rather than throwing, since "not logged in" is an
+// expected state, not an error.
 export async function getCurrentUser(): Promise<User | null> {
   try {
     const { data } = await client.get<AuthResponse>('/api/auth/me')
+    csrfToken = data.csrf_token
     return data.user
   } catch (err) {
     if (axios.isAxiosError(err) && err.response?.status === 401) {
+      csrfToken = null
       return null
     }
     throw err

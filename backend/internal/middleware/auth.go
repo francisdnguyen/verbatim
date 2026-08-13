@@ -15,25 +15,30 @@ type contextKey string
 // userIDKey is where AuthMiddleware stores the authenticated caller's ID.
 const userIDKey contextKey = "userID"
 
+// csrfTokenKey is where AuthMiddleware stores the request's verified CSRF
+// token — needed so HandleMe can hand it back to the frontend on a page
+// reload, the only other place besides login/register that the frontend
+// can (re-)learn its in-memory CSRF value from.
+const csrfTokenKey contextKey = "csrfToken"
+
 // TokenCookieName holds the signed JWT, set httpOnly so client-side JS can
 // never read it (closes the XSS-token-exfiltration path localStorage had).
 // Exported so handlers.go (which sets/clears it on login/register/logout)
 // and this middleware (which reads it) share one name.
 const TokenCookieName = "verbatim_token"
 
-// CSRFCookieName holds the double-submit CSRF token. Deliberately NOT
-// httpOnly — the frontend must be able to read it and echo it back in the
-// X-CSRF-Token header, which is exactly what proves the request came from
-// same-origin JS and not a cross-site form/script riding the auth cookie.
-const CSRFCookieName = "verbatim_csrf"
-
 // AuthMiddleware requires a valid session cookie (see TokenCookieName),
 // injecting the token's user ID into the request context for downstream
 // handlers. For any state-changing method (everything but GET/HEAD/OPTIONS)
-// it also requires the CSRF cookie's value to match the X-CSRF-Token header
-// — the cookie alone isn't enough proof of intent, since a browser attaches
-// cookies to cross-site requests automatically regardless of who triggered
-// them.
+// it also requires the X-CSRF-Token header to match the CSRF value signed
+// into the token itself (services.TokenClaims.CSRFToken) — the session
+// cookie alone isn't proof of intent, since a browser attaches cookies to
+// cross-site requests automatically regardless of who triggered them. This
+// is a double-submit pattern with the "cookie" half folded into the JWT
+// rather than a second real cookie — see the comment on
+// services.AuthService.ValidateToken for why: frontend and backend sit on
+// different domains, so a plain second cookie set by the backend would
+// never be readable by the frontend's own JS to echo back.
 func AuthMiddleware(authService *services.AuthService) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -43,26 +48,28 @@ func AuthMiddleware(authService *services.AuthService) func(http.Handler) http.H
 				return
 			}
 
-			userID, err := authService.ValidateToken(cookie.Value)
+			claims, err := authService.ValidateToken(cookie.Value)
 			if err != nil {
 				writeUnauthorized(w, "invalid or expired session")
 				return
 			}
 
 			if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-				// A plain != is intentional, not an oversight: unlike the JWT
-				// signature above, this isn't comparing against a server-side
-				// secret — both the cookie and the header are values the
-				// browser/attacker can already observe, so there's no timing
-				// side-channel worth defending with subtle.ConstantTimeCompare.
-				csrfCookie, err := r.Cookie(CSRFCookieName)
-				if err != nil || csrfCookie.Value == "" || csrfCookie.Value != r.Header.Get("X-CSRF-Token") {
+				// A plain != is intentional, not an oversight: this isn't a
+				// second comparison against a server-side secret — the JWT
+				// signature above already proved claims.CSRFToken is
+				// genuine, so this is just checking the caller can produce
+				// the value that was returned in the login/register/me
+				// response body. No timing side-channel worth defending
+				// with subtle.ConstantTimeCompare.
+				if claims.CSRFToken == "" || claims.CSRFToken != r.Header.Get("X-CSRF-Token") {
 					writeForbidden(w, "missing or invalid CSRF token")
 					return
 				}
 			}
 
-			ctx := context.WithValue(r.Context(), userIDKey, userID)
+			ctx := context.WithValue(r.Context(), userIDKey, claims.UserID)
+			ctx = context.WithValue(ctx, csrfTokenKey, claims.CSRFToken)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -73,6 +80,14 @@ func AuthMiddleware(authService *services.AuthService) func(http.Handler) http.H
 func GetUserID(r *http.Request) (string, bool) {
 	userID, ok := r.Context().Value(userIDKey).(string)
 	return userID, ok
+}
+
+// GetCSRFToken retrieves the authenticated caller's CSRF token stored by
+// AuthMiddleware — HandleMe uses this to hand the value back to the
+// frontend on a page reload.
+func GetCSRFToken(r *http.Request) (string, bool) {
+	token, ok := r.Context().Value(csrfTokenKey).(string)
+	return token, ok
 }
 
 // writeUnauthorized writes a 401 JSON {"error": message} body. A local

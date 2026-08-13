@@ -33,4 +33,5 @@ export interface User {
 
 export interface AuthResponse {
   user: User
+  csrf_token: string
 }

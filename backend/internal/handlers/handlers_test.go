@@ -65,30 +65,30 @@ func createTestUser(t *testing.T, db *database.DB, email string) string {
 	return userID
 }
 
+// testCSRFToken is embedded into every test-issued token via testAuthToken
+// below and sent back as the X-CSRF-Token header by doRequest — standing in
+// for the value a real login/register/me response body would have handed
+// the frontend, since these tests bypass HandleLogin entirely.
+const testCSRFToken = "test-csrf-token"
+
 // testAuthToken issues a real token for userID/email via the same
 // AuthService the test server validates against — bypasses HandleLogin/
 // plaintext passwords entirely, since these tests exercise video/ask
 // behavior, not the login flow itself (which has its own tests).
 func testAuthToken(t *testing.T, authService *services.AuthService, userID, email string) string {
 	t.Helper()
-	token, err := authService.GenerateToken(userID, email)
+	token, err := authService.GenerateToken(userID, email, testCSRFToken)
 	if err != nil {
 		t.Fatalf("generate test token: %v", err)
 	}
 	return token
 }
 
-// testCSRFToken is an arbitrary fixed value used as both the CSRF cookie
-// and the X-CSRF-Token header in every test request — these tests bypass
-// HandleLogin (see testAuthToken), so there's no real login flow that paired
-// the two together; the middleware only checks that they match each other,
-// not that either came from a real session.
-const testCSRFToken = "test-csrf-token"
-
-// doRequest sends method/url with the session/CSRF cookies AuthMiddleware
-// now expects (it stopped reading the Authorization header once auth moved
-// to httpOnly cookies) — a helper because http.Post/http.Get don't support
-// custom headers/cookies, and every call in this file now needs both.
+// doRequest sends method/url with the session cookie AuthMiddleware expects
+// (it stopped reading the Authorization header once auth moved to httpOnly
+// cookies) plus the X-CSRF-Token header matching what's embedded in the
+// token — a helper because http.Post/http.Get don't support custom
+// headers/cookies, and every call in this file now needs both.
 func doRequest(t *testing.T, method, url, token string, body io.Reader, contentType string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(method, url, body)
@@ -99,7 +99,6 @@ func doRequest(t *testing.T, method, url, token string, body io.Reader, contentT
 		req.Header.Set("Content-Type", contentType)
 	}
 	req.AddCookie(&http.Cookie{Name: middleware.TokenCookieName, Value: token})
-	req.AddCookie(&http.Cookie{Name: middleware.CSRFCookieName, Value: testCSRFToken})
 	req.Header.Set("X-CSRF-Token", testCSRFToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -225,13 +224,15 @@ func TestVideoHandlers_Live(t *testing.T) {
 	}
 
 	// 403 for a state-changing request with a valid session cookie but a
-	// missing/mismatched CSRF token — confirms the double-submit check
-	// actually blocks a request that only has the (automatically-attached)
-	// session cookie, the exact shape of a forged cross-site request.
+	// missing X-CSRF-Token header — confirms the check actually blocks a
+	// request that only has the (automatically-attached) session cookie,
+	// the exact shape of a forged cross-site request: an attacker's page
+	// can trigger the cookie-bearing request, but has no way to learn the
+	// CSRF value embedded in the token to also set as a header.
 	csrfReq, _ := http.NewRequest("POST", srv.URL+"/api/videos", bytes.NewReader(body))
 	csrfReq.Header.Set("Content-Type", "application/json")
 	csrfReq.AddCookie(&http.Cookie{Name: middleware.TokenCookieName, Value: token})
-	// Deliberately no CSRF cookie/header at all.
+	// Deliberately no X-CSRF-Token header at all.
 	csrfResp, err := http.DefaultClient.Do(csrfReq)
 	if err != nil {
 		t.Fatalf("POST without csrf token: %v", err)

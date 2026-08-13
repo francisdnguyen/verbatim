@@ -313,11 +313,15 @@ type loginRequest struct {
 
 // userResponse is the JSON body returned by HandleRegister/HandleLogin/
 // HandleMe. The JWT itself is never included here — it only ever travels as
-// an httpOnly cookie, never somewhere client-side JS could read it.
+// an httpOnly cookie, never somewhere client-side JS could read it directly.
+// CSRFToken IS included here deliberately: it's the only way the frontend
+// can learn it, since it's signed into that same httpOnly cookie and can't
+// be read back out any other way (see services.AuthService.ValidateToken).
 // models.User.PasswordHash already carries json:"-", so it's never
 // serialized here either.
 type userResponse struct {
-	User models.User `json:"user"`
+	User      models.User `json:"user"`
+	CSRFToken string      `json:"csrf_token"`
 }
 
 // minPasswordLength is the minimum acceptable length for a new password —
@@ -332,10 +336,11 @@ func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
-// generateCSRFToken returns a random hex string for the double-submit CSRF
-// cookie — nothing here needs to be verifiable/signed like the JWT, just
-// unguessable, since its only job is proving the request-issuing JS could
-// read the cookie (i.e. is running on the real frontend origin).
+// generateCSRFToken returns a random hex string, embedded as a claim inside
+// the JWT (see services.AuthService.GenerateToken) rather than a second
+// cookie — nothing here needs to be verifiable/signed on its own, just
+// unguessable; the JWT's own signature is what makes it trustworthy once
+// it's inside the token.
 func generateCSRFToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -344,56 +349,44 @@ func generateCSRFToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// setAuthCookies sets the httpOnly session cookie and the JS-readable CSRF
-// cookie together, sized to expire alongside the JWT itself (services.TokenTTL).
-// secure/sameSite follow the secureCookies flag main.go derives from
-// COOKIE_SECURE: production (cross-site, HTTPS both ends) needs
-// SameSite=None+Secure for the browser to send the cookie at all; local dev
-// (plain HTTP) can't set Secure, and SameSite=None without Secure is
-// rejected by browsers outright, so it falls back to SameSite=Lax instead.
-func setAuthCookies(w http.ResponseWriter, token, csrfToken string, secureCookies bool) {
+// setAuthCookie sets the httpOnly session cookie, sized to expire alongside
+// the JWT itself (services.TokenTTL). secure/sameSite follow the
+// secureCookies flag main.go derives from COOKIE_SECURE: production
+// (cross-site, HTTPS both ends) needs SameSite=None+Secure for the browser
+// to send the cookie at all; local dev (plain HTTP) can't set Secure, and
+// SameSite=None without Secure is rejected by browsers outright, so it
+// falls back to SameSite=Lax instead.
+func setAuthCookie(w http.ResponseWriter, token string, secureCookies bool) {
 	sameSite := http.SameSiteLaxMode
 	if secureCookies {
 		sameSite = http.SameSiteNoneMode
 	}
-	maxAge := int(services.TokenTTL.Seconds())
 	http.SetCookie(w, &http.Cookie{
 		Name:     middleware.TokenCookieName,
 		Value:    token,
 		Path:     "/",
-		MaxAge:   maxAge,
+		MaxAge:   int(services.TokenTTL.Seconds()),
 		HttpOnly: true,
-		Secure:   secureCookies,
-		SameSite: sameSite,
-	})
-	http.SetCookie(w, &http.Cookie{
-		Name:     middleware.CSRFCookieName,
-		Value:    csrfToken,
-		Path:     "/",
-		MaxAge:   maxAge,
-		HttpOnly: false, // the frontend must read this to echo it in X-CSRF-Token
 		Secure:   secureCookies,
 		SameSite: sameSite,
 	})
 }
 
-// clearAuthCookies expires both auth cookies immediately, for logout.
-func clearAuthCookies(w http.ResponseWriter, secureCookies bool) {
+// clearAuthCookie expires the session cookie immediately, for logout.
+func clearAuthCookie(w http.ResponseWriter, secureCookies bool) {
 	sameSite := http.SameSiteLaxMode
 	if secureCookies {
 		sameSite = http.SameSiteNoneMode
 	}
-	for _, name := range []string{middleware.TokenCookieName, middleware.CSRFCookieName} {
-		http.SetCookie(w, &http.Cookie{
-			Name:     name,
-			Value:    "",
-			Path:     "/",
-			MaxAge:   -1,
-			HttpOnly: name == middleware.TokenCookieName,
-			Secure:   secureCookies,
-			SameSite: sameSite,
-		})
-	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     middleware.TokenCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   secureCookies,
+		SameSite: sameSite,
+	})
 }
 
 // HandleRegister creates a new user and starts a session for it — a
@@ -435,21 +428,21 @@ func HandleRegister(db *database.DB, authService *services.AuthService, secureCo
 			return
 		}
 
-		token, err := authService.GenerateToken(user.ID, user.Email)
-		if err != nil {
-			log.Printf("register: generate token: %v", err)
-			writeError(w, http.StatusInternalServerError, "failed to register")
-			return
-		}
 		csrfToken, err := generateCSRFToken()
 		if err != nil {
 			log.Printf("register: generate csrf token: %v", err)
 			writeError(w, http.StatusInternalServerError, "failed to register")
 			return
 		}
+		token, err := authService.GenerateToken(user.ID, user.Email, csrfToken)
+		if err != nil {
+			log.Printf("register: generate token: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to register")
+			return
+		}
 
-		setAuthCookies(w, token, csrfToken, secureCookies)
-		writeJSON(w, http.StatusCreated, userResponse{User: user})
+		setAuthCookie(w, token, secureCookies)
+		writeJSON(w, http.StatusCreated, userResponse{User: user, CSRFToken: csrfToken})
 	}
 }
 
@@ -486,41 +479,44 @@ func HandleLogin(db *database.DB, authService *services.AuthService, secureCooki
 			return
 		}
 
-		token, err := authService.GenerateToken(user.ID, user.Email)
-		if err != nil {
-			log.Printf("login: generate token: %v", err)
-			writeError(w, http.StatusInternalServerError, "failed to log in")
-			return
-		}
 		csrfToken, err := generateCSRFToken()
 		if err != nil {
 			log.Printf("login: generate csrf token: %v", err)
 			writeError(w, http.StatusInternalServerError, "failed to log in")
 			return
 		}
+		token, err := authService.GenerateToken(user.ID, user.Email, csrfToken)
+		if err != nil {
+			log.Printf("login: generate token: %v", err)
+			writeError(w, http.StatusInternalServerError, "failed to log in")
+			return
+		}
 
-		setAuthCookies(w, token, csrfToken, secureCookies)
-		writeJSON(w, http.StatusOK, userResponse{User: user})
+		setAuthCookie(w, token, secureCookies)
+		writeJSON(w, http.StatusOK, userResponse{User: user, CSRFToken: csrfToken})
 	}
 }
 
-// HandleLogout clears the session/CSRF cookies. Not CSRF-protected itself —
-// worst case a forged cross-site logout just deauthenticates the caller,
-// which isn't the kind of state change CSRF protection exists to prevent.
+// HandleLogout clears the session cookie. Not CSRF-protected itself — worst
+// case a forged cross-site logout just deauthenticates the caller, which
+// isn't the kind of state change CSRF protection exists to prevent.
 func HandleLogout(secureCookies bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		clearAuthCookies(w, secureCookies)
+		clearAuthCookie(w, secureCookies)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
-// HandleMe returns the currently authenticated caller's user record — the
-// session-bootstrap endpoint the frontend calls on load to find out who (if
-// anyone) is logged in, now that the token itself lives in an httpOnly
-// cookie the frontend's JS can't read directly.
+// HandleMe returns the currently authenticated caller's user record and
+// their current CSRF token — the session-bootstrap endpoint the frontend
+// calls on load to find out who (if anyone) is logged in and re-learn the
+// CSRF value a fresh page load doesn't have in memory anymore, now that the
+// token itself lives in an httpOnly cookie the frontend's JS can't read
+// directly.
 func HandleMe(db *database.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, _ := middleware.GetUserID(r)
+		csrfToken, _ := middleware.GetCSRFToken(r)
 		user, err := db.GetUserByID(r.Context(), userID)
 		if errors.Is(err, database.ErrUserNotFound) {
 			// A validly-signed session cookie for a user deleted after the
@@ -535,7 +531,7 @@ func HandleMe(db *database.DB) http.HandlerFunc {
 			writeError(w, http.StatusInternalServerError, "failed to load user")
 			return
 		}
-		writeJSON(w, http.StatusOK, userResponse{User: user})
+		writeJSON(w, http.StatusOK, userResponse{User: user, CSRFToken: csrfToken})
 	}
 }
 
